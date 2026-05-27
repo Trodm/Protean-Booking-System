@@ -11,7 +11,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 application = FastAPI(title="Protean Booking System")
 
 DB_FILE = "protean_bookings.db"
-ADMIN_PASSWORD = "admin123"
+ADMIN_PASSWORD = "protean123%"
 
 CSS = """
 <style>
@@ -148,7 +148,7 @@ async def client_interface():
     <body><div class="container">
     <div class="nav"><b>Protean Booking System <span class="badge">Client Interface</span></b></div>
     <h1>Client Booking Interface</h1>
-    <p class="subtitle">Reference, Law Firm, Assessment Place and Assessment Date are captured once at the top. Claimant records are captured below.</p>
+    <p class="subtitle">Medico-legal.</p>
     <form action="/submit-bulk" method="post">
     <div class="top-grid">
         <div><label><b>Reference</b></label><input name="reference" placeholder="Reference Number"></div>
