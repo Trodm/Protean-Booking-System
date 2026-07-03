@@ -287,6 +287,7 @@ async def backend(request: Request):
     """
 
     body_html += "<tr>" + "".join(f"<td>{v if v is not None else ''}</td>" for v in row) + delete_button + "</tr>"
+    
     teams_status = "Configured" if TEAMS_WEBHOOK_URL else "Configured."
     return f"<html><head><title>Protean Backend</title>{CSS}</head><body><div class='container'><div class='brand-header'><img class='logo' src='data:image/png;base64,{LOGO_BASE64}'><h1>Admin Backend</h1></div><div class='nav'><b>Protean Booking System <span class='badge'>Admin Backend</span></b><div><a class='btn' href='/client'>Client Interface</a><a class='btn btn-green' href='/export?admin_key={ADMIN_PASSWORD}'>Export CSV</a><a class='btn btn-orange' href='/export-excel?admin_key={ADMIN_PASSWORD}'>Export Excel</a></div></div><div class='notice'>Microsoft Teams Integration: {teams_status}</div><div class='table-wrap'><table><tr>{header_html}</tr>{body_html}</table></div></div></body></html>"
 
