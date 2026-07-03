@@ -18,7 +18,7 @@ application.mount("/static", StaticFiles(directory="static"), name="static")
 DB_FILE = "protean_bookings.db"
 ADMIN_PASSWORD = "Protean123%"
 RETENTION_DAYS = 365
-TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
+TEAMS_WEBHOOK_URL = os.getenv("https://teams.microsoft.com/l/channel/19%3A34762dafb7fc427a9cf4b44d7a496a58%40thread.tacv2/Booking%20Tool?groupId=75aec17d-ec41-4041-a295-18a7f89a3c1d&tenantId=6a332dd2-de65-4fa5-92e6-dc155a4781f9", "")
 
 CSS = """
 <style>
