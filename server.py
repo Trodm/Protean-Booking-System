@@ -278,32 +278,33 @@ async def backend(request: Request):
 
     body_html = ""
 
-    for row in rows:
-        booking_id = row[0]
+    for value in row:
+    body_html += f"<td>{value if value is not None else ''}</td>"
+       booking_id = row[0]
 
-        body_html += "<tr>"
+body_html += f"""
+<td>
+<form action="/delete-booking?admin_key={ADMIN_PASSWORD}"
+      method="post"
+      onsubmit="return confirm('Delete this booking?');">
 
-        for value in row:
-            body_html += f"<td>{value if value is not None else ''}</td>"
+<input type="hidden"
+       name="booking_id"
+       value="{booking_id}">
 
-        body_html += f"""
-        <td>
-            <form action="/delete-booking?admin_key={ADMIN_PASSWORD}"
-                  method="post"
-                  onsubmit="return confirm('Delete this booking?');">
+<button style="
+background:#dc2626;
+color:white;
+border:none;
+padding:6px 10px;
+border-radius:4px;
+cursor:pointer;">
+Delete
+</button>
 
-                <input type="hidden"
-                       name="booking_id"
-                       value="{booking_id}">
-
-                <button type="submit"
-                        style="background:#b91c1c;color:white;">
-                    Delete
-                </button>
-
-            </form>
-        </td>
-        """
+</form>
+</td>
+"""
 
         body_html += "</tr>"
 
@@ -317,16 +318,22 @@ async def backend(request: Request):
     """
 
 @application.post("/delete-booking")
-async def delete_booking(request: Request, booking_id: int = Form(...)):
+async def delete_booking(
+    request: Request,
+    booking_id: int = Form(...)
+):
+
     if not is_admin(request):
         return RedirectResponse("/admin-login", status_code=302)
 
     conn = get_db()
     cur = conn.cursor()
+
     cur.execute(
         "DELETE FROM bookings WHERE id=?",
         (booking_id,)
     )
+
     conn.commit()
     conn.close()
 
