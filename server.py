@@ -270,23 +270,70 @@ async def admin_login_submit(password: str = Form("")):
 async def backend(request: Request):
     if not is_admin(request):
         return RedirectResponse("/admin-login", status_code=302)
-    headers, rows = fetch_bookings()
-   header_html = "".join(f"<th>{h}</th>" for h in headers) + "<th>Action</th>"
-    body_html = ""
-    for row in rows:
-    booking_id = row[0]
 
-    delete_button = f"""
-    <td>
-        <form action="/delete-booking?admin_key={ADMIN_PASSWORD}" method="post"
-              onsubmit="return confirm('Are you sure you want to delete this booking? This action cannot be undone.');">
-            <input type="hidden" name="booking_id" value="{booking_id}">
-            <button type="submit" style="background:#b91c1c;">Delete</button>
-        </form>
-    </td>
+    headers, rows = fetch_bookings()
+
+    header_html = "".join(f"<th>{h}</th>" for h in headers)
+    header_html += "<th>Action</th>"
+
+    body_html = ""
+
+    for row in rows:
+        booking_id = row[0]
+
+        body_html += "<tr>"
+
+        for value in row:
+            body_html += f"<td>{value if value is not None else ''}</td>"
+
+        body_html += f"""
+        <td>
+            <form action="/delete-booking?admin_key={ADMIN_PASSWORD}"
+                  method="post"
+                  onsubmit="return confirm('Delete this booking?');">
+
+                <input type="hidden"
+                       name="booking_id"
+                       value="{booking_id}">
+
+                <button type="submit"
+                        style="background:#b91c1c;color:white;">
+                    Delete
+                </button>
+
+            </form>
+        </td>
+        """
+
+        body_html += "</tr>"
+
+    return f"""
+    ...
+    <table>
+        <tr>{header_html}</tr>
+        {body_html}
+    </table>
+    ...
     """
 
-    body_html += "<tr>" + "".join(f"<td>{v if v is not None else ''}</td>" for v in row) + delete_button + "</tr>"
+@application.post("/delete-booking")
+async def delete_booking(request: Request, booking_id: int = Form(...)):
+    if not is_admin(request):
+        return RedirectResponse("/admin-login", status_code=302)
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM bookings WHERE id=?",
+        (booking_id,)
+    )
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(
+        f"/backend?admin_key={ADMIN_PASSWORD}",
+        status_code=302
+    )
     
     teams_status = "Configured" if TEAMS_WEBHOOK_URL else "Configured."
     return f"<html><head><title>Protean Backend</title>{CSS}</head><body><div class='container'><div class='brand-header'><img class='logo' src='data:image/png;base64,{LOGO_BASE64}'><h1>Admin Backend</h1></div><div class='nav'><b>Protean Booking System <span class='badge'>Admin Backend</span></b><div><a class='btn' href='/client'>Client Interface</a><a class='btn btn-green' href='/export?admin_key={ADMIN_PASSWORD}'>Export CSV</a><a class='btn btn-orange' href='/export-excel?admin_key={ADMIN_PASSWORD}'>Export Excel</a></div></div><div class='notice'>Microsoft Teams Integration: {teams_status}</div><div class='table-wrap'><table><tr>{header_html}</tr>{body_html}</table></div></div></body></html>"
