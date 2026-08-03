@@ -568,11 +568,20 @@ def upload_file_to_sharepoint(file_info, submission_reference: str, token: str, 
 
 def sync_files_to_sharepoint(saved_files, submission_reference: str):
     if not saved_files:
-        return
+        return False
     if not sharepoint_is_configured():
-        raise RuntimeError(
-            "SharePoint credentials are missing. Configure MS_TENANT_ID, MS_CLIENT_ID and MS_CLIENT_SECRET in Render."
+        # Do not fail or reject the client's booking. Files remain safely stored
+        # in persistent local storage and are marked for later SharePoint sync.
+        for file_info in saved_files:
+            file_info.setdefault("sharepoint_item_id", "")
+            file_info.setdefault("sharepoint_url", "")
+            file_info["sharepoint_status"] = "Pending configuration"
+            file_info["sharepoint_error"] = ""
+        print(
+            f"SHAREPOINT_SYNC_PENDING [{submission_reference}]: "
+            "Microsoft Graph credentials are not configured; files retained locally."
         )
+        return False
 
     token = get_graph_access_token()
     site_id, drive_id, drive_name = resolve_sharepoint_site_and_drive(token)
@@ -587,6 +596,7 @@ def sync_files_to_sharepoint(saved_files, submission_reference: str):
             f"SharePoint sync successful: site={site_id}, drive={drive_name} ({drive_id}), "
             f"folder={SHAREPOINT_FOLDER_PATH}, files={len(saved_files)}"
         )
+        return True
     except Exception as exc:
         error_text = str(exc)[:2000]
         for file_info in saved_files:
@@ -829,17 +839,26 @@ async def submit_bulk(
         sharepoint_message = ""
         if saved_files:
             try:
-                sync_files_to_sharepoint(saved_files, submission_reference)
+                synced = sync_files_to_sharepoint(saved_files, submission_reference)
                 with db_connection() as conn:
                     for file_info in saved_files:
                         conn.execute(
                             """UPDATE booking_documents
-                               SET sharepoint_url=?, sharepoint_item_id=?, sharepoint_status='Uploaded', sharepoint_error=''
+                               SET sharepoint_url=?, sharepoint_item_id=?, sharepoint_status=?, sharepoint_error=?
                                WHERE submission_reference=? AND stored_filename=?""",
                             (file_info.get("sharepoint_url", ""), file_info.get("sharepoint_item_id", ""),
+                             file_info.get("sharepoint_status", "Pending configuration"),
+                             file_info.get("sharepoint_error", ""),
                              submission_reference, file_info["stored_filename"]),
                         )
-                sharepoint_message = f"{len(saved_files)} document(s) uploaded to SharePoint."
+                if synced:
+                    sharepoint_message = f"{len(saved_files)} document(s) uploaded to SharePoint."
+                else:
+                    sharepoint_ok = False
+                    sharepoint_message = (
+                        f"{len(saved_files)} document(s) were received and stored safely. "
+                        "SharePoint synchronisation is pending administrator configuration."
+                    )
             except Exception as sync_exc:
                 sharepoint_ok = False
                 error_text = str(sync_exc)[:2000]
