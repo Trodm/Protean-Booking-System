@@ -28,6 +28,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", str(DEFAULT_DATA_DIR))).resolve()
 DB_FILE = Path(os.getenv("DB_FILE", str(DATA_DIR / "protean_bookings.db"))).resolve()
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads"))).resolve()
 EXPORT_DIR = Path(os.getenv("EXPORT_DIR", str(DATA_DIR / "exports"))).resolve()
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(DATA_DIR / "backups"))).resolve()
 
 # Configure these in the hosting environment instead of hard-coding production secrets.
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Protean123%")
@@ -41,6 +42,7 @@ ALLOWED_EXTENSIONS = {
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 LOGO_BASE64 = "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"
@@ -177,6 +179,30 @@ def db_connection():
         conn.close()
 
 
+def backup_database():
+    """Create an atomic SQLite backup and retain the latest 30 copies."""
+    if not DB_FILE.exists():
+        return
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = BACKUP_DIR / f"protean_bookings_{timestamp}.db"
+    source = sqlite3.connect(DB_FILE, timeout=30)
+    target = sqlite3.connect(backup_path)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+    backups = sorted(BACKUP_DIR.glob("protean_bookings_*.db"), key=lambda x: x.stat().st_mtime, reverse=True)
+    for old_backup in backups[30:]:
+        old_backup.unlink(missing_ok=True)
+
+
+def ensure_column(conn, table_name: str, column_name: str, definition: str):
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
 def init_db():
     with db_connection() as conn:
         conn.execute("""
@@ -231,9 +257,13 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_booking_id ON booking_documents(booking_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_submission_reference ON booking_documents(submission_reference)")
+        ensure_column(conn, "bookings", "is_archived", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "bookings", "archived_at", "TEXT")
+        ensure_column(conn, "booking_documents", "is_archived", "INTEGER NOT NULL DEFAULT 0")
 
 
 init_db()
+backup_database()
 
 
 def option_tags(items):
@@ -250,9 +280,13 @@ def safe_text(value):
 
 def fetch_bookings():
     with db_connection() as conn:
-        cur = conn.execute("SELECT * FROM bookings ORDER BY id DESC")
-        rows = cur.fetchall()
-        headers = [d[0] for d in cur.description]
+        cur = conn.execute("SELECT * FROM bookings WHERE COALESCE(is_archived, 0)=0 ORDER BY id DESC")
+        all_headers = [d[0] for d in cur.description]
+        all_rows = cur.fetchall()
+    hidden = {"is_archived", "archived_at"}
+    keep_indexes = [i for i, name in enumerate(all_headers) if name not in hidden]
+    headers = [all_headers[i] for i in keep_indexes]
+    rows = [tuple(row[i] for i in keep_indexes) for row in all_rows]
     return headers, rows
 
 
@@ -389,7 +423,9 @@ async def health():
         "database": str(DB_FILE),
         "upload_directory": str(UPLOAD_DIR),
         "upload_directory_exists": UPLOAD_DIR.exists(),
-        "persistent_disk_recommended": str(DATA_DIR).startswith("/var/data"),
+        "persistent_disk_active": str(DATA_DIR).startswith("/var/data"),
+        "backup_directory": str(BACKUP_DIR),
+        "database_backups": len(list(BACKUP_DIR.glob("protean_bookings_*.db"))),
     }
 
 
@@ -559,6 +595,7 @@ async def submit_bulk(
                         file_info["file_size"], now
                     ))
 
+        backup_database()
         notify_teams(law_firm, assessment_date, len(booking_ids), len(saved_files))
         return f"""
         <html><head>{CSS}</head><body><div class='container'>
@@ -649,11 +686,12 @@ async def backend(request: Request):
             <div>
                 <a class="btn" href="/client">Client Interface</a>
                 <a class="btn" href="/admin/documents?admin_key={quote(ADMIN_PASSWORD)}">All Documents</a>
+                <a class="btn" href="/admin/backup?admin_key={quote(ADMIN_PASSWORD)}">Download Backup</a>
                 <a class="btn btn-green" href="/export?admin_key={quote(ADMIN_PASSWORD)}">Export CSV</a>
                 <a class="btn btn-orange" href="/export-excel?admin_key={quote(ADMIN_PASSWORD)}">Export Excel</a>
             </div>
         </div>
-        <div class="notice">Microsoft Teams notification: {teams_status}. Uploaded files are stored in <b>{safe_text(UPLOAD_DIR)}</b>.</div>
+        <div class="notice">Microsoft Teams notification: {teams_status}. Data is stored in <b>{safe_text(DATA_DIR)}</b>; uploaded files in <b>{safe_text(UPLOAD_DIR)}</b>; automatic database backups in <b>{safe_text(BACKUP_DIR)}</b>.</div>
         <div class="table-wrap"><table><tr>{header_html}</tr>{body_html}</table></div>
     </div></body></html>
     """
@@ -686,15 +724,18 @@ async def delete_booking(request: Request, booking_id: int = Form(...)):
     if not is_admin(request):
         return RedirectResponse("/admin-login", status_code=303)
 
-    # Preserve every uploaded document and its database record. Deleting a
-    # booking removes only the booking link; the files remain downloadable
-    # from the permanent document archive.
+    # Soft-delete only: preserve the booking, all fields and every uploaded file.
+    archived_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with db_connection() as conn:
         conn.execute(
-            "UPDATE booking_documents SET booking_id=NULL WHERE booking_id=?",
+            "UPDATE bookings SET is_archived=1, archived_at=? WHERE id=?",
+            (archived_at, booking_id),
+        )
+        conn.execute(
+            "UPDATE booking_documents SET is_archived=1 WHERE booking_id=?",
             (booking_id,),
         )
-        conn.execute("DELETE FROM bookings WHERE id=?", (booking_id,))
+    backup_database()
 
     return RedirectResponse(
         f"/backend?admin_key={quote(ADMIN_PASSWORD)}",
@@ -776,6 +817,15 @@ async def all_documents(request: Request):
         </div>
     </div></body></html>
     """
+
+
+@application.get("/admin/backup")
+async def create_manual_backup(request: Request):
+    if not is_admin(request):
+        return RedirectResponse("/admin-login", status_code=303)
+    backup_database()
+    latest = max(BACKUP_DIR.glob("protean_bookings_*.db"), key=lambda x: x.stat().st_mtime)
+    return FileResponse(latest, media_type="application/octet-stream", filename=latest.name)
 
 
 @application.get("/export")
