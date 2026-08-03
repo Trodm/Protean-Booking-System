@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime
 from contextlib import contextmanager
 from html import escape
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 import sqlite3
 import csv
 import os
@@ -33,6 +33,15 @@ BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(DATA_DIR / "backups"))).resolve()
 # Configure these in the hosting environment instead of hard-coding production secrets.
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Protean123%")
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
+
+# Microsoft Graph / SharePoint settings. Configure these as Render environment variables.
+MS_TENANT_ID = os.getenv("MS_TENANT_ID", "")
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "")
+MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
+SHAREPOINT_HOSTNAME = os.getenv("SHAREPOINT_HOSTNAME", "proteancoza.sharepoint.com")
+SHAREPOINT_SITE_PATH = os.getenv("SHAREPOINT_SITE_PATH", "/sites/protean")
+SHAREPOINT_FOLDER_PATH = os.getenv("SHAREPOINT_FOLDER_PATH", "General/Booked Claimants")
+SHAREPOINT_REQUIRED = os.getenv("SHAREPOINT_REQUIRED", "true").lower() in {"1", "true", "yes"}
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "25"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_EXTENSIONS = {
@@ -260,6 +269,10 @@ def init_db():
         ensure_column(conn, "bookings", "is_archived", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "bookings", "archived_at", "TEXT")
         ensure_column(conn, "booking_documents", "is_archived", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "booking_documents", "sharepoint_url", "TEXT")
+        ensure_column(conn, "booking_documents", "sharepoint_item_id", "TEXT")
+        ensure_column(conn, "booking_documents", "sharepoint_status", "TEXT NOT NULL DEFAULT 'Pending'")
+        ensure_column(conn, "booking_documents", "sharepoint_error", "TEXT")
 
 
 init_db()
@@ -379,6 +392,121 @@ async def save_uploaded_file(upload: UploadFile, submission_reference: str):
     finally:
         await upload.close()
 
+
+def sharepoint_is_configured():
+    return all([MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET])
+
+
+def get_graph_access_token():
+    if not sharepoint_is_configured():
+        raise RuntimeError(
+            "SharePoint is not configured. Set MS_TENANT_ID, MS_CLIENT_ID and MS_CLIENT_SECRET."
+        )
+    token_url = f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token"
+    body = urlencode({
+        "client_id": MS_CLIENT_ID,
+        "client_secret": MS_CLIENT_SECRET,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        token_url,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    token = payload.get("access_token")
+    if not token:
+        raise RuntimeError("Microsoft Graph did not return an access token.")
+    return token
+
+
+def graph_json_request(url: str, token: str):
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def upload_file_to_sharepoint(file_info, submission_reference: str, token: str, site_id: str):
+    # The supplied SharePoint URL resolves to:
+    # Shared Documents / General / Booked Claimants.
+    folder = SHAREPOINT_FOLDER_PATH.strip("/")
+    remote_name = clean_filename(
+        f"{submission_reference}_{file_info['original_filename']}"
+    )
+    encoded_path = "/".join(quote(part, safe="") for part in (folder + "/" + remote_name).split("/"))
+    upload_url = (
+        f"https://graph.microsoft.com/v1.0/sites/{quote(site_id, safe='')}/"
+        f"drive/root:/{encoded_path}:/content"
+    )
+    data = file_info["path"].read_bytes()
+    request = urllib.request.Request(
+        upload_url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": file_info["content_type"] or "application/octet-stream",
+        },
+        method="PUT",
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    return {
+        "sharepoint_item_id": result.get("id", ""),
+        "sharepoint_url": result.get("webUrl", ""),
+        "sharepoint_status": "Uploaded",
+        "sharepoint_error": "",
+    }
+
+
+def sync_files_to_sharepoint(saved_files, submission_reference: str):
+    if not saved_files:
+        return
+    if not sharepoint_is_configured():
+        if SHAREPOINT_REQUIRED:
+            raise RuntimeError(
+                "SharePoint upload is required but Microsoft Graph credentials are missing."
+            )
+        for file_info in saved_files:
+            file_info.update({
+                "sharepoint_item_id": "",
+                "sharepoint_url": "",
+                "sharepoint_status": "Not configured",
+                "sharepoint_error": "Microsoft Graph credentials are missing.",
+            })
+        return
+
+    token = get_graph_access_token()
+    site_lookup_url = (
+        f"https://graph.microsoft.com/v1.0/sites/"
+        f"{SHAREPOINT_HOSTNAME}:{SHAREPOINT_SITE_PATH}"
+    )
+    site = graph_json_request(site_lookup_url, token)
+    site_id = site.get("id")
+    if not site_id:
+        raise RuntimeError("The SharePoint site could not be resolved.")
+
+    uploaded = []
+    try:
+        for file_info in saved_files:
+            result = upload_file_to_sharepoint(file_info, submission_reference, token, site_id)
+            file_info.update(result)
+            uploaded.append(file_info)
+    except Exception as exc:
+        # Local copies remain intact. The submission is stopped so the client is not
+        # told that SharePoint succeeded when it did not.
+        for file_info in saved_files:
+            file_info.setdefault("sharepoint_item_id", "")
+            file_info.setdefault("sharepoint_url", "")
+            file_info["sharepoint_status"] = "Failed"
+            file_info["sharepoint_error"] = str(exc)[:1000]
+        raise RuntimeError(f"SharePoint upload failed: {exc}") from exc
 
 def notify_teams(law_firm, assessment_date, saved, document_count):
     if not TEAMS_WEBHOOK_URL:
@@ -545,6 +673,9 @@ async def submit_bulk(
             if upload and upload.filename:
                 saved_files.append(await save_uploaded_file(upload, submission_reference))
 
+        # Upload each client document to SharePoint before confirming the booking.
+        sync_files_to_sharepoint(saved_files, submission_reference)
+
         booking_ids = []
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with db_connection() as conn:
@@ -587,12 +718,16 @@ async def submit_bulk(
                     conn.execute("""
                     INSERT INTO booking_documents (
                         submission_reference, booking_id, original_filename, stored_filename,
-                        content_type, file_size, uploaded_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        content_type, file_size, uploaded_at, sharepoint_url,
+                        sharepoint_item_id, sharepoint_status, sharepoint_error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         submission_reference, booking_id, file_info["original_filename"],
                         file_info["stored_filename"], file_info["content_type"],
-                        file_info["file_size"], now
+                        file_info["file_size"], now, file_info.get("sharepoint_url", ""),
+                        file_info.get("sharepoint_item_id", ""),
+                        file_info.get("sharepoint_status", "Pending"),
+                        file_info.get("sharepoint_error", "")
                     ))
 
         backup_database()
@@ -602,7 +737,7 @@ async def submit_bulk(
         <div class='brand-header'>
             <img class='logo' src='data:image/png;base64,{LOGO_BASE64}' alt='Protean Medico Legal'>
             <h1>{len(booking_ids)} booking(s) submitted successfully.</h1>
-            <p>{len(saved_files)} document(s) uploaded and made available to the admin backend.</p>
+            <p>{len(saved_files)} document(s) uploaded to SharePoint and retained in the admin backup.</p>
         </div>
         <div class='actions'><a class='btn' href='/client'>Submit Another Booking</a></div>
         </div></body></html>
@@ -612,12 +747,11 @@ async def submit_bulk(
             file_info["path"].unlink(missing_ok=True)
         return RedirectResponse("/client?error=" + quote(str(exc)), status_code=303)
     except Exception as exc:
-        for file_info in saved_files:
-            file_info["path"].unlink(missing_ok=True)
+        # Keep local copies for recovery if SharePoint or another external service fails.
         # Avoid exposing server internals to clients; log details in hosting logs.
         print(f"Submission error: {type(exc).__name__}: {exc}")
         return RedirectResponse(
-            "/client?error=" + quote("The booking could not be saved. Please verify the files and try again."),
+            "/client?error=" + quote("The booking or SharePoint upload could not be completed. Your locally received files were retained for recovery. Please contact the administrator."),
             status_code=303,
         )
 
