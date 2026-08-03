@@ -18,11 +18,16 @@ from openpyxl import Workbook
 
 application = FastAPI(title="Protean Booking System")
 
-# Use absolute paths so the application behaves consistently on Render/Windows/Linux.
+# Use absolute paths and a persistent data directory.
+# On Render, attach a Persistent Disk at /var/data. The application will use it
+# automatically when available. You can also override DATA_DIR, DB_FILE,
+# UPLOAD_DIR and EXPORT_DIR through environment variables.
 BASE_DIR = Path(__file__).resolve().parent
-DB_FILE = Path(os.getenv("DB_FILE", str(BASE_DIR / "protean_bookings.db"))).resolve()
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "uploads"))).resolve()
-EXPORT_DIR = Path(os.getenv("EXPORT_DIR", str(BASE_DIR / "exports"))).resolve()
+DEFAULT_DATA_DIR = Path("/var/data") if Path("/var/data").exists() else BASE_DIR
+DATA_DIR = Path(os.getenv("DATA_DIR", str(DEFAULT_DATA_DIR))).resolve()
+DB_FILE = Path(os.getenv("DB_FILE", str(DATA_DIR / "protean_bookings.db"))).resolve()
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads"))).resolve()
+EXPORT_DIR = Path(os.getenv("EXPORT_DIR", str(DATA_DIR / "exports"))).resolve()
 
 # Configure these in the hosting environment instead of hard-coding production secrets.
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Protean123%")
@@ -188,6 +193,19 @@ def fetch_documents_for_bookings(booking_ids: List[int]):
     return result
 
 
+def fetch_all_documents():
+    with db_connection() as conn:
+        rows = conn.execute(
+            """SELECT d.id, d.booking_id, d.submission_reference,
+                      d.original_filename, d.content_type, d.file_size,
+                      d.uploaded_at, b.claimant_name, b.law_firm
+               FROM booking_documents d
+               LEFT JOIN bookings b ON b.id = d.booking_id
+               ORDER BY d.id DESC"""
+        ).fetchall()
+    return rows
+
+
 def format_size(size):
     size = int(size or 0)
     if size < 1024:
@@ -280,9 +298,11 @@ async def root():
 async def health():
     return {
         "status": "ok",
+        "data_directory": str(DATA_DIR),
         "database": str(DB_FILE),
         "upload_directory": str(UPLOAD_DIR),
         "upload_directory_exists": UPLOAD_DIR.exists(),
+        "persistent_disk_recommended": str(DATA_DIR).startswith("/var/data"),
     }
 
 
@@ -533,6 +553,7 @@ async def backend(request: Request):
             <b>Protean Booking System <span class="badge">Admin Backend</span></b>
             <div>
                 <a class="btn" href="/client">Client Interface</a>
+                <a class="btn" href="/admin/documents?admin_key={quote(ADMIN_PASSWORD)}">All Documents</a>
                 <a class="btn btn-green" href="/export?admin_key={quote(ADMIN_PASSWORD)}">Export CSV</a>
                 <a class="btn btn-orange" href="/export-excel?admin_key={quote(ADMIN_PASSWORD)}">Export Excel</a>
             </div>
@@ -570,20 +591,96 @@ async def delete_booking(request: Request, booking_id: int = Form(...)):
     if not is_admin(request):
         return RedirectResponse("/admin-login", status_code=303)
 
-    # Files shared by other claimants in the same submission are kept until no links remain.
+    # Preserve every uploaded document and its database record. Deleting a
+    # booking removes only the booking link; the files remain downloadable
+    # from the permanent document archive.
     with db_connection() as conn:
-        stored_names = [r[0] for r in conn.execute(
-            "SELECT stored_filename FROM booking_documents WHERE booking_id=?", (booking_id,)
-        ).fetchall()]
+        conn.execute(
+            "UPDATE booking_documents SET booking_id=NULL WHERE booking_id=?",
+            (booking_id,),
+        )
         conn.execute("DELETE FROM bookings WHERE id=?", (booking_id,))
-        for stored_name in stored_names:
-            remaining = conn.execute(
-                "SELECT COUNT(*) FROM booking_documents WHERE stored_filename=?", (stored_name,)
-            ).fetchone()[0]
-            if remaining == 0:
-                (UPLOAD_DIR / stored_name).unlink(missing_ok=True)
 
-    return RedirectResponse(f"/backend?admin_key={quote(ADMIN_PASSWORD)}", status_code=303)
+    return RedirectResponse(
+        f"/backend?admin_key={quote(ADMIN_PASSWORD)}",
+        status_code=303,
+    )
+
+
+@application.get("/admin/documents", response_class=HTMLResponse)
+async def all_documents(request: Request):
+    if not is_admin(request):
+        return RedirectResponse("/admin-login", status_code=303)
+
+    rows = fetch_all_documents()
+    body_html = ""
+
+    for (
+        document_id, booking_id, submission_reference, original_filename,
+        content_type, file_size, uploaded_at, claimant_name, law_firm
+    ) in rows:
+        linked_to = (
+            f"{safe_text(claimant_name)} — {safe_text(law_firm)}"
+            if booking_id is not None
+            else "<span class='small'>Archived: original booking deleted</span>"
+        )
+        body_html += f"""
+        <tr>
+            <td>{document_id}</td>
+            <td>{safe_text(submission_reference)}</td>
+            <td>{linked_to}</td>
+            <td>{safe_text(original_filename)}</td>
+            <td>{safe_text(content_type)}</td>
+            <td>{format_size(file_size)}</td>
+            <td>{safe_text(uploaded_at)}</td>
+            <td>
+                <a class="btn btn-green"
+                   href="/admin/document/{document_id}?admin_key={quote(ADMIN_PASSWORD)}">
+                    Download
+                </a>
+            </td>
+        </tr>
+        """
+
+    if not rows:
+        body_html = "<tr><td colspan='8'>No documents have been uploaded.</td></tr>"
+
+    return f"""
+    <html><head><title>All Uploaded Documents</title>{CSS}</head>
+    <body><div class="container">
+        <div class="brand-header">
+            <img class="logo" src="data:image/png;base64,{LOGO_BASE64}" alt="Protean Medico Legal">
+            <h1>All Uploaded Documents</h1>
+            <p class="subtitle">Permanent document archive</p>
+        </div>
+        <div class="nav">
+            <b>Protean Booking System <span class="badge">Admin Backend</span></b>
+            <div>
+                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}">Back to Backend</a>
+                <a class="btn" href="/client">Client Interface</a>
+            </div>
+        </div>
+        <div class="notice">
+            Documents remain in this archive even when a booking is deleted.
+            Storage location: <b>{safe_text(UPLOAD_DIR)}</b>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <tr>
+                    <th>ID</th>
+                    <th>Submission Reference</th>
+                    <th>Linked Booking</th>
+                    <th>File Name</th>
+                    <th>File Type</th>
+                    <th>File Size</th>
+                    <th>Uploaded At</th>
+                    <th>Action</th>
+                </tr>
+                {body_html}
+            </table>
+        </div>
+    </div></body></html>
+    """
 
 
 @application.get("/export")
