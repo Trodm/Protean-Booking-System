@@ -44,7 +44,7 @@ SHAREPOINT_HOSTNAME = os.getenv("SHAREPOINT_HOSTNAME", "proteancoza.sharepoint.c
 SHAREPOINT_SITE_PATH = os.getenv("SHAREPOINT_SITE_PATH", "/sites/protean")
 SHAREPOINT_FOLDER_PATH = os.getenv("SHAREPOINT_FOLDER_PATH", "General/Booked Claimants")
 SHAREPOINT_DRIVE_NAME = os.getenv("SHAREPOINT_DRIVE_NAME", "Documents")
-SHAREPOINT_REQUIRED = os.getenv("SHAREPOINT_REQUIRED", "true").lower() in {"1", "true", "yes"}
+SHAREPOINT_REQUIRED = os.getenv("SHAREPOINT_REQUIRED", "false").lower() in {"1", "true", "yes"}
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "25"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_EXTENSIONS = {
@@ -312,20 +312,25 @@ def fetch_documents_for_bookings(booking_ids: List[int]):
     placeholders = ",".join("?" for _ in booking_ids)
     with db_connection() as conn:
         rows = conn.execute(
-            f"""SELECT id, booking_id, original_filename, content_type, file_size, uploaded_at
+            f"""SELECT id, booking_id, original_filename, content_type, file_size, uploaded_at,
+                       sharepoint_url, sharepoint_status, sharepoint_error
                 FROM booking_documents
                 WHERE booking_id IN ({placeholders})
                 ORDER BY id""",
             booking_ids,
         ).fetchall()
     result = {}
-    for document_id, booking_id, original_name, content_type, file_size, uploaded_at in rows:
+    for (document_id, booking_id, original_name, content_type, file_size, uploaded_at,
+         sharepoint_url, sharepoint_status, sharepoint_error) in rows:
         result.setdefault(booking_id, []).append({
             "id": document_id,
             "name": original_name,
             "content_type": content_type,
             "size": file_size,
             "uploaded_at": uploaded_at,
+            "sharepoint_url": sharepoint_url or "",
+            "sharepoint_status": sharepoint_status or "Pending",
+            "sharepoint_error": sharepoint_error or "",
         })
     return result
 
@@ -758,8 +763,13 @@ async def submit_bulk(
             if upload and upload.filename:
                 saved_files.append(await save_uploaded_file(upload, submission_reference))
 
-        # Upload each client document to SharePoint before confirming the booking.
-        sync_files_to_sharepoint(saved_files, submission_reference)
+        # Save the booking and local document records first. SharePoint sync happens
+        # afterwards so a Microsoft outage never destroys the client's submission.
+        for file_info in saved_files:
+            file_info["sharepoint_status"] = "Pending"
+            file_info["sharepoint_error"] = ""
+            file_info["sharepoint_url"] = ""
+            file_info["sharepoint_item_id"] = ""
 
         booking_ids = []
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -815,14 +825,48 @@ async def submit_bulk(
                         file_info.get("sharepoint_error", "")
                     ))
 
+        sharepoint_ok = True
+        sharepoint_message = ""
+        if saved_files:
+            try:
+                sync_files_to_sharepoint(saved_files, submission_reference)
+                with db_connection() as conn:
+                    for file_info in saved_files:
+                        conn.execute(
+                            """UPDATE booking_documents
+                               SET sharepoint_url=?, sharepoint_item_id=?, sharepoint_status='Uploaded', sharepoint_error=''
+                               WHERE submission_reference=? AND stored_filename=?""",
+                            (file_info.get("sharepoint_url", ""), file_info.get("sharepoint_item_id", ""),
+                             submission_reference, file_info["stored_filename"]),
+                        )
+                sharepoint_message = f"{len(saved_files)} document(s) uploaded to SharePoint."
+            except Exception as sync_exc:
+                sharepoint_ok = False
+                error_text = str(sync_exc)[:2000]
+                with db_connection() as conn:
+                    conn.execute(
+                        """UPDATE booking_documents
+                           SET sharepoint_status='Pending retry', sharepoint_error=?
+                           WHERE submission_reference=?""",
+                        (error_text, submission_reference),
+                    )
+                print(f"SHAREPOINT_SYNC_ERROR [{submission_reference}]: {error_text}")
+                sharepoint_message = (
+                    f"{len(saved_files)} document(s) were safely retained and queued for SharePoint retry. "
+                    "The booking was not lost."
+                )
+                if SHAREPOINT_REQUIRED:
+                    print("SHAREPOINT_REQUIRED is enabled, but the booking remains preserved locally.")
+
         backup_database()
         notify_teams(law_firm, assessment_date, len(booking_ids), len(saved_files))
+        status_class = "success" if sharepoint_ok else "notice"
         return f"""
         <html><head>{CSS}</head><body><div class='container'>
         <div class='brand-header'>
             <img class='logo' src='data:image/png;base64,{LOGO_BASE64}' alt='Protean Medico Legal'>
             <h1>{len(booking_ids)} booking(s) submitted successfully.</h1>
-            <p>{len(saved_files)} document(s) uploaded to SharePoint and retained in the admin backup.</p>
+            <div class='{status_class}'>{safe_text(sharepoint_message)}</div>
         </div>
         <div class='actions'><a class='btn' href='/client'>Submit Another Booking</a></div>
         </div></body></html>
@@ -854,6 +898,94 @@ async def admin_login_submit(password: str = Form("")):
     return RedirectResponse("/admin-login?error=1", status_code=303)
 
 
+def test_sharepoint_connection():
+    """Return a detailed diagnostic without exposing credentials."""
+    diagnostics = {
+        "configured": sharepoint_is_configured(),
+        "hostname": SHAREPOINT_HOSTNAME,
+        "site_path": SHAREPOINT_SITE_PATH,
+        "drive_name": SHAREPOINT_DRIVE_NAME,
+        "folder_path": SHAREPOINT_FOLDER_PATH,
+    }
+    if not diagnostics["configured"]:
+        missing = [name for name, value in {
+            "MS_TENANT_ID": MS_TENANT_ID,
+            "MS_CLIENT_ID": MS_CLIENT_ID,
+            "MS_CLIENT_SECRET": MS_CLIENT_SECRET,
+        }.items() if not value]
+        raise RuntimeError("Missing Render environment variables: " + ", ".join(missing))
+    token = get_graph_access_token()
+    site_id, drive_id, drive_name = resolve_sharepoint_site_and_drive(token)
+    ensure_sharepoint_folder(token, drive_id, SHAREPOINT_FOLDER_PATH)
+    diagnostics.update({"site_id": site_id, "drive_id": drive_id, "resolved_drive_name": drive_name})
+    return diagnostics
+
+
+@application.get("/admin/sharepoint-test", response_class=HTMLResponse)
+async def admin_sharepoint_test(request: Request):
+    if not is_admin(request):
+        return RedirectResponse("/admin-login", status_code=303)
+    try:
+        details = test_sharepoint_connection()
+        message = (
+            "SharePoint connection successful. "
+            f"Site: {safe_text(details['site_path'])}; "
+            f"Library: {safe_text(details['resolved_drive_name'])}; "
+            f"Folder: {safe_text(details['folder_path'])}."
+        )
+        css_class = "success"
+    except Exception as exc:
+        message = "SharePoint connection failed: " + str(exc)
+        css_class = "error"
+    return f"""
+    <html><head><title>SharePoint Test</title>{CSS}</head><body><div class='container'>
+      <div class='brand-header'><img class='logo' src='data:image/png;base64,{LOGO_BASE64}' alt='Protean Medico Legal'><h1>SharePoint Connection Test</h1></div>
+      <div class='{css_class}'>{safe_text(message)}</div>
+      <div class='actions'><a class='btn' href='/backend?admin_key={quote(ADMIN_PASSWORD)}'>Back to Backend</a></div>
+    </div></body></html>
+    """
+
+
+@application.post("/admin/sharepoint-retry")
+async def admin_sharepoint_retry(request: Request, document_id: int = Form(...)):
+    if not is_admin(request):
+        return RedirectResponse("/admin-login", status_code=303)
+    with db_connection() as conn:
+        row = conn.execute(
+            """SELECT submission_reference, original_filename, stored_filename, content_type, file_size
+               FROM booking_documents WHERE id=?""",
+            (document_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Document record not found")
+    submission_reference, original_filename, stored_filename, content_type, file_size = row
+    file_path = (UPLOAD_DIR / stored_filename).resolve()
+    if file_path.parent != UPLOAD_DIR or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Local recovery file not found")
+    file_info = {
+        "original_filename": original_filename,
+        "stored_filename": stored_filename,
+        "content_type": content_type or "application/octet-stream",
+        "file_size": file_size,
+        "path": file_path,
+    }
+    try:
+        sync_files_to_sharepoint([file_info], submission_reference)
+        with db_connection() as conn:
+            conn.execute(
+                """UPDATE booking_documents SET sharepoint_url=?, sharepoint_item_id=?,
+                   sharepoint_status='Uploaded', sharepoint_error='' WHERE id=?""",
+                (file_info.get("sharepoint_url", ""), file_info.get("sharepoint_item_id", ""), document_id),
+            )
+    except Exception as exc:
+        with db_connection() as conn:
+            conn.execute(
+                "UPDATE booking_documents SET sharepoint_status='Pending retry', sharepoint_error=? WHERE id=?",
+                (str(exc)[:2000], document_id),
+            )
+    return RedirectResponse(f"/backend?admin_key={quote(ADMIN_PASSWORD)}", status_code=303)
+
+
 @application.get("/backend", response_class=HTMLResponse)
 async def backend(request: Request):
     if not is_admin(request):
@@ -875,11 +1007,27 @@ async def backend(request: Request):
 
         documents = documents_by_booking.get(booking_id, [])
         if documents:
-            links = "".join(
-                f"<li><a href='/admin/document/{doc['id']}?admin_key={quote(ADMIN_PASSWORD)}'>{safe_text(doc['name'])}</a> "
-                f"<span class='small'>({format_size(doc['size'])})</span></li>"
-                for doc in documents
-            )
+            links = ""
+            for doc in documents:
+                status = safe_text(doc.get("sharepoint_status", "Pending"))
+                error = safe_text(doc.get("sharepoint_error", ""))
+                sp_link = (
+                    f" <a class='btn btn-green' target='_blank' href='{safe_text(doc['sharepoint_url'])}'>SharePoint</a>"
+                    if doc.get("sharepoint_url") else ""
+                )
+                retry = ""
+                if doc.get("sharepoint_status") != "Uploaded":
+                    retry = f"""
+                    <form style='display:inline' action='/admin/sharepoint-retry?admin_key={quote(ADMIN_PASSWORD)}' method='post'>
+                      <input type='hidden' name='document_id' value='{doc['id']}'>
+                      <button type='submit' class='btn-orange'>Retry Upload</button>
+                    </form>"""
+                error_html = f"<div class='small' title='{error}'>Error: {error[:180]}</div>" if error else ""
+                links += (
+                    f"<li><a href='/admin/document/{doc['id']}?admin_key={quote(ADMIN_PASSWORD)}'>{safe_text(doc['name'])}</a> "
+                    f"<span class='small'>({format_size(doc['size'])}) — SharePoint: {status}</span> "
+                    f"{sp_link}{retry}{error_html}</li>"
+                )
             body_html += f"<td><ul class='file-list'>{links}</ul></td>"
         else:
             body_html += "<td><span class='small'>No documents</span></td>"
@@ -905,6 +1053,7 @@ async def backend(request: Request):
             <div>
                 <a class="btn" href="/client">Client Interface</a>
                 <a class="btn" href="/admin/documents?admin_key={quote(ADMIN_PASSWORD)}">All Documents</a>
+                <a class="btn btn-orange" href="/admin/sharepoint-test?admin_key={quote(ADMIN_PASSWORD)}">Test SharePoint</a>
                 <a class="btn" href="/admin/backup?admin_key={quote(ADMIN_PASSWORD)}">Download Backup</a>
                 <a class="btn btn-green" href="/export?admin_key={quote(ADMIN_PASSWORD)}">Export CSV</a>
                 <a class="btn btn-orange" href="/export-excel?admin_key={quote(ADMIN_PASSWORD)}">Export Excel</a>
