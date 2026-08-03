@@ -11,6 +11,8 @@ import csv
 import os
 import json
 import urllib.request
+import urllib.error
+import time
 import shutil
 import uuid
 import mimetypes
@@ -41,6 +43,7 @@ MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
 SHAREPOINT_HOSTNAME = os.getenv("SHAREPOINT_HOSTNAME", "proteancoza.sharepoint.com")
 SHAREPOINT_SITE_PATH = os.getenv("SHAREPOINT_SITE_PATH", "/sites/protean")
 SHAREPOINT_FOLDER_PATH = os.getenv("SHAREPOINT_FOLDER_PATH", "General/Booked Claimants")
+SHAREPOINT_DRIVE_NAME = os.getenv("SHAREPOINT_DRIVE_NAME", "Documents")
 SHAREPOINT_REQUIRED = os.getenv("SHAREPOINT_REQUIRED", "true").lower() in {"1", "true", "yes"}
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "25"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -397,11 +400,43 @@ def sharepoint_is_configured():
     return all([MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET])
 
 
+def _http_error_message(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return f"HTTP {exc.code} {exc.reason}: {body[:2000]}"
+    return str(exc)
+
+
+def graph_request(url: str, token: str, method: str = "GET", data=None, headers=None, timeout: int = 60):
+    request_headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            if not raw:
+                return {}
+            return json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(_http_error_message(exc)) from exc
+
+
 def get_graph_access_token():
     if not sharepoint_is_configured():
-        raise RuntimeError(
-            "SharePoint is not configured. Set MS_TENANT_ID, MS_CLIENT_ID and MS_CLIENT_SECRET."
-        )
+        missing = [name for name, value in {
+            "MS_TENANT_ID": MS_TENANT_ID,
+            "MS_CLIENT_ID": MS_CLIENT_ID,
+            "MS_CLIENT_SECRET": MS_CLIENT_SECRET,
+        }.items() if not value]
+        raise RuntimeError("Missing Render environment variables: " + ", ".join(missing))
+
     token_url = f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token"
     body = urlencode({
         "client_id": MS_CLIENT_ID,
@@ -415,98 +450,148 @@ def get_graph_access_token():
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("Microsoft sign-in failed: " + _http_error_message(exc)) from exc
+
     token = payload.get("access_token")
     if not token:
         raise RuntimeError("Microsoft Graph did not return an access token.")
     return token
 
 
-def graph_json_request(url: str, token: str):
-    request = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        method="GET",
+def resolve_sharepoint_site_and_drive(token: str):
+    site_lookup_url = (
+        f"https://graph.microsoft.com/v1.0/sites/"
+        f"{SHAREPOINT_HOSTNAME}:{SHAREPOINT_SITE_PATH}"
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+    site = graph_request(site_lookup_url, token)
+    site_id = site.get("id")
+    if not site_id:
+        raise RuntimeError("The SharePoint site could not be resolved.")
+
+    drives = graph_request(
+        f"https://graph.microsoft.com/v1.0/sites/{quote(site_id, safe='')}/drives",
+        token,
+    ).get("value", [])
+
+    requested = SHAREPOINT_DRIVE_NAME.strip().lower()
+    drive = next((d for d in drives if str(d.get("name", "")).strip().lower() == requested), None)
+    if drive is None:
+        drive = next((d for d in drives if str(d.get("name", "")).strip().lower() in {"documents", "shared documents"}), None)
+    if drive is None and drives:
+        drive = drives[0]
+    if drive is None:
+        raise RuntimeError("No SharePoint document library was found for this site.")
+
+    return site_id, drive["id"], drive.get("name", "")
 
 
-def upload_file_to_sharepoint(file_info, submission_reference: str, token: str, site_id: str):
-    # The supplied SharePoint URL resolves to:
-    # Shared Documents / General / Booked Claimants.
+def ensure_sharepoint_folder(token: str, drive_id: str, folder_path: str):
+    parent_id = "root"
+    current_parts = []
+    for part in [p.strip() for p in folder_path.strip("/").split("/") if p.strip()]:
+        current_parts.append(part)
+        encoded = "/".join(quote(p, safe="") for p in current_parts)
+        lookup_url = f"https://graph.microsoft.com/v1.0/drives/{quote(drive_id, safe='')}/root:/{encoded}"
+        try:
+            item = graph_request(lookup_url, token)
+            parent_id = item.get("id", parent_id)
+            continue
+        except RuntimeError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+
+        create_url = f"https://graph.microsoft.com/v1.0/drives/{quote(drive_id, safe='')}/items/{quote(parent_id, safe='')}/children"
+        payload = json.dumps({
+            "name": part,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "fail",
+        }).encode("utf-8")
+        try:
+            item = graph_request(
+                create_url,
+                token,
+                method="POST",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+        except RuntimeError as exc:
+            # Another request may have created the folder between lookup and create.
+            if "HTTP 409" in str(exc):
+                item = graph_request(lookup_url, token)
+            else:
+                raise
+        parent_id = item.get("id", parent_id)
+
+
+def upload_file_to_sharepoint(file_info, submission_reference: str, token: str, drive_id: str):
     folder = SHAREPOINT_FOLDER_PATH.strip("/")
-    remote_name = clean_filename(
-        f"{submission_reference}_{file_info['original_filename']}"
-    )
+    remote_name = clean_filename(f"{submission_reference}_{file_info['original_filename']}")
     encoded_path = "/".join(quote(part, safe="") for part in (folder + "/" + remote_name).split("/"))
     upload_url = (
-        f"https://graph.microsoft.com/v1.0/sites/{quote(site_id, safe='')}/"
-        f"drive/root:/{encoded_path}:/content"
+        f"https://graph.microsoft.com/v1.0/drives/{quote(drive_id, safe='')}/"
+        f"root:/{encoded_path}:/content?@microsoft.graph.conflictBehavior=rename"
     )
     data = file_info["path"].read_bytes()
-    request = urllib.request.Request(
-        upload_url,
-        data=data,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": file_info["content_type"] or "application/octet-stream",
-        },
-        method="PUT",
-    )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        result = json.loads(response.read().decode("utf-8"))
-    return {
-        "sharepoint_item_id": result.get("id", ""),
-        "sharepoint_url": result.get("webUrl", ""),
-        "sharepoint_status": "Uploaded",
-        "sharepoint_error": "",
-    }
+
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            result = graph_request(
+                upload_url,
+                token,
+                method="PUT",
+                data=data,
+                headers={"Content-Type": file_info["content_type"] or "application/octet-stream"},
+                timeout=180,
+            )
+            return {
+                "sharepoint_item_id": result.get("id", ""),
+                "sharepoint_url": result.get("webUrl", ""),
+                "sharepoint_status": "Uploaded",
+                "sharepoint_error": "",
+            }
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Upload failed after 3 attempts: {last_error}")
 
 
 def sync_files_to_sharepoint(saved_files, submission_reference: str):
     if not saved_files:
         return
     if not sharepoint_is_configured():
-        if SHAREPOINT_REQUIRED:
-            raise RuntimeError(
-                "SharePoint upload is required but Microsoft Graph credentials are missing."
-            )
-        for file_info in saved_files:
-            file_info.update({
-                "sharepoint_item_id": "",
-                "sharepoint_url": "",
-                "sharepoint_status": "Not configured",
-                "sharepoint_error": "Microsoft Graph credentials are missing.",
-            })
-        return
+        raise RuntimeError(
+            "SharePoint credentials are missing. Configure MS_TENANT_ID, MS_CLIENT_ID and MS_CLIENT_SECRET in Render."
+        )
 
     token = get_graph_access_token()
-    site_lookup_url = (
-        f"https://graph.microsoft.com/v1.0/sites/"
-        f"{SHAREPOINT_HOSTNAME}:{SHAREPOINT_SITE_PATH}"
-    )
-    site = graph_json_request(site_lookup_url, token)
-    site_id = site.get("id")
-    if not site_id:
-        raise RuntimeError("The SharePoint site could not be resolved.")
+    site_id, drive_id, drive_name = resolve_sharepoint_site_and_drive(token)
+    ensure_sharepoint_folder(token, drive_id, SHAREPOINT_FOLDER_PATH)
 
-    uploaded = []
     try:
         for file_info in saved_files:
-            result = upload_file_to_sharepoint(file_info, submission_reference, token, site_id)
+            result = upload_file_to_sharepoint(file_info, submission_reference, token, drive_id)
+            result["sharepoint_error"] = ""
             file_info.update(result)
-            uploaded.append(file_info)
+        print(
+            f"SharePoint sync successful: site={site_id}, drive={drive_name} ({drive_id}), "
+            f"folder={SHAREPOINT_FOLDER_PATH}, files={len(saved_files)}"
+        )
     except Exception as exc:
-        # Local copies remain intact. The submission is stopped so the client is not
-        # told that SharePoint succeeded when it did not.
+        error_text = str(exc)[:2000]
         for file_info in saved_files:
             file_info.setdefault("sharepoint_item_id", "")
             file_info.setdefault("sharepoint_url", "")
             file_info["sharepoint_status"] = "Failed"
-            file_info["sharepoint_error"] = str(exc)[:1000]
-        raise RuntimeError(f"SharePoint upload failed: {exc}") from exc
+            file_info["sharepoint_error"] = error_text
+        print(f"SHAREPOINT_SYNC_ERROR: {error_text}")
+        raise RuntimeError(f"SharePoint upload failed: {error_text}") from exc
+
 
 def notify_teams(law_firm, assessment_date, saved, document_count):
     if not TEAMS_WEBHOOK_URL:
