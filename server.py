@@ -26,7 +26,12 @@ application = FastAPI(title="Protean Booking System")
 # automatically when available. You can also override DATA_DIR, DB_FILE,
 # UPLOAD_DIR and EXPORT_DIR through environment variables.
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_DIR = Path("/var/data") if Path("/var/data").exists() else BASE_DIR
+# Render deployment: mount a Persistent Disk at /var/data and set DATA_DIR=/var/data.
+# Keep one service instance for SQLite. Back up the disk separately as well.
+# Only for a genuinely new installation: set ALLOW_NEW_DATABASE=true once.
+ON_RENDER = os.getenv("RENDER", "").lower() == "true" or bool(os.getenv("RENDER_SERVICE_ID"))
+PERSISTENT_MOUNT = Path(os.getenv("PERSISTENT_DISK_PATH", "/var/data")).resolve()
+DEFAULT_DATA_DIR = PERSISTENT_MOUNT if ON_RENDER or PERSISTENT_MOUNT.is_mount() else BASE_DIR
 DATA_DIR = Path(os.getenv("DATA_DIR", str(DEFAULT_DATA_DIR))).resolve()
 DB_FILE = Path(os.getenv("DB_FILE", str(DATA_DIR / "protean_bookings.db"))).resolve()
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads"))).resolve()
@@ -53,6 +58,16 @@ ALLOWED_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".txt"
 }
 
+def check_storage():
+    if ON_RENDER:
+        if not PERSISTENT_MOUNT.is_mount():
+            raise RuntimeError("Persistent disk is not mounted. Attach the existing Render disk at /var/data; refusing to use temporary storage.")
+        for location in (DATA_DIR, DB_FILE, UPLOAD_DIR, BACKUP_DIR):
+            if not location.is_relative_to(PERSISTENT_MOUNT):
+                raise RuntimeError("Database, uploads and backups must all be on the persistent disk.")
+
+
+check_storage()
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -178,11 +193,15 @@ FILE_UPLOAD_SCRIPT = r"""
 """
 
 @contextmanager
-def db_connection():
-    conn = sqlite3.connect(DB_FILE, timeout=30)
+def db_connection(create=False):
+    check_storage()
+    # Normal reads/writes must never create a new empty database.
+    mode = "rwc" if create else "rw"
+    conn = sqlite3.connect(DB_FILE.as_uri() + "?mode=" + mode, uri=True, timeout=30)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = FULL")
         yield conn
         conn.commit()
     except Exception:
@@ -193,21 +212,73 @@ def db_connection():
 
 
 def backup_database():
-    """Create an atomic SQLite backup and retain the latest 30 copies."""
-    if not DB_FILE.exists():
-        return
+    """Publish only complete snapshots; retain daily recovery points for 90 days."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = BACKUP_DIR / f"protean_bookings_{timestamp}.db"
-    source = sqlite3.connect(DB_FILE, timeout=30)
-    target = sqlite3.connect(backup_path)
+    temporary = backup_path.with_suffix(".partial")
     try:
-        source.backup(target)
-    finally:
-        target.close()
-        source.close()
-    backups = sorted(BACKUP_DIR.glob("protean_bookings_*.db"), key=lambda x: x.stat().st_mtime, reverse=True)
-    for old_backup in backups[30:]:
-        old_backup.unlink(missing_ok=True)
+        with db_connection() as source:
+            target = sqlite3.connect(temporary)
+            try:
+                source.backup(target)
+                if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise RuntimeError("Backup verification failed")
+            finally:
+                target.close()
+        temporary.replace(backup_path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    # Keep the latest 30 snapshots plus one snapshot per day for 90 days.
+    backups = sorted(BACKUP_DIR.glob("protean_bookings_*.db"), reverse=True)
+    keep = set(backups[:30])
+    days = set()
+    for snapshot in backups:
+        day = snapshot.name.split("_")[2]
+        if day not in days and len(days) < 90:
+            keep.add(snapshot)
+            days.add(day)
+    for snapshot in backups:
+        if snapshot not in keep:
+            snapshot.unlink(missing_ok=True)
+    return backup_path
+
+
+def prepare_database():
+    """Recover a missing database only; never overwrite an existing database."""
+    marker = DB_FILE.with_suffix(DB_FILE.suffix + ".initialized")
+    if DB_FILE.exists():
+        with sqlite3.connect(DB_FILE.as_uri() + "?mode=ro", uri=True) as conn:
+            if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise RuntimeError("Database integrity check failed. Preserve this disk and restore a verified backup before restarting.")
+            has_bookings = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bookings'").fetchone()
+            if not has_bookings:
+                raise RuntimeError("Existing database has no bookings table. Check DB_FILE; refusing to replace it with an empty backend.")
+        return
+    backups = sorted(BACKUP_DIR.glob("protean_bookings_*.db"), reverse=True)
+    if Path(str(DB_FILE) + "-wal").exists():
+        raise RuntimeError("Database missing but transaction journal exists. Preserve files for database recovery.")
+    for snapshot in backups:
+        temporary = DB_FILE.with_suffix(".recovering")
+        try:
+            with sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True) as source:
+                if source.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    continue
+                source.execute("SELECT COUNT(*) FROM bookings").fetchone()
+                with sqlite3.connect(temporary) as target:
+                    source.backup(target)
+            temporary.replace(DB_FILE)
+            print(f"DATABASE_RECOVERED_FROM_BACKUP: {snapshot.name}")
+            return
+        except sqlite3.DatabaseError:
+            continue
+        finally:
+            temporary.unlink(missing_ok=True)
+    legacy = BASE_DIR / "protean_bookings.db"
+    if marker.exists() or backups or (legacy != DB_FILE and legacy.exists()):
+        raise RuntimeError("Existing booking storage could not be opened. Restore or migrate the original SQLite database and uploads; refusing to start with an empty database.")
+    if ON_RENDER and os.getenv("ALLOW_NEW_DATABASE", "").lower() != "true":
+        raise RuntimeError("No existing database found on the persistent disk. Restore the original database, or set ALLOW_NEW_DATABASE=true only for a genuinely new installation.")
 
 
 def ensure_column(conn, table_name: str, column_name: str, definition: str):
@@ -217,7 +288,7 @@ def ensure_column(conn, table_name: str, column_name: str, definition: str):
 
 
 def init_db():
-    with db_connection() as conn:
+    with db_connection(create=True) as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -280,8 +351,9 @@ def init_db():
         ensure_column(conn, "booking_documents", "sharepoint_error", "TEXT")
 
 
+prepare_database()
 init_db()
-backup_database()
+DB_FILE.with_suffix(DB_FILE.suffix + ".initialized").touch()
 
 # Mandatory categories follow the existing booking Terms and Conditions.
 MANDATORY_DOCUMENTS = {
@@ -306,12 +378,13 @@ def safe_text(value):
     return escape("" if value is None else str(value))
 
 
-def fetch_bookings():
+def fetch_bookings(view="all"):
     with db_connection() as conn:
-        cur = conn.execute("SELECT * FROM bookings WHERE COALESCE(is_archived, 0)=0 ORDER BY id DESC")
+        where = {"active": " WHERE COALESCE(is_archived, 0)=0", "archived": " WHERE COALESCE(is_archived, 0)=1", "all": ""}.get(view, "")
+        cur = conn.execute("SELECT * FROM bookings" + where + " ORDER BY id DESC")
         all_headers = [d[0] for d in cur.description]
         all_rows = cur.fetchall()
-    hidden = {"is_archived", "archived_at"}
+    hidden = set()
     keep_indexes = [i for i, name in enumerate(all_headers) if name not in hidden]
     headers = [all_headers[i] for i in keep_indexes]
     rows = [tuple(row[i] for i in keep_indexes) for row in all_rows]
@@ -657,13 +730,18 @@ async def root():
 
 @application.get("/health")
 async def health():
+    try:
+        with db_connection() as conn:
+            conn.execute("SELECT COUNT(*) FROM bookings").fetchone()
+    except Exception:
+        raise HTTPException(status_code=503, detail="Booking storage unavailable; administrator recovery required.")
     return {
         "status": "ok",
         "data_directory": str(DATA_DIR),
         "database": str(DB_FILE),
         "upload_directory": str(UPLOAD_DIR),
         "upload_directory_exists": UPLOAD_DIR.exists(),
-        "persistent_disk_active": str(DATA_DIR).startswith("/var/data"),
+        "persistent_disk_active": PERSISTENT_MOUNT.is_mount() and DATA_DIR.is_relative_to(PERSISTENT_MOUNT),
         "backup_directory": str(BACKUP_DIR),
         "database_backups": len(list(BACKUP_DIR.glob("protean_bookings_*.db"))),
     }
@@ -981,7 +1059,10 @@ async def submit_bulk(
                 if SHAREPOINT_REQUIRED:
                     print("SHAREPOINT_REQUIRED is enabled, but the booking remains preserved locally.")
 
-        backup_database()
+        try:
+            backup_database()
+        except Exception as backup_exc:
+            print(f"BACKUP_FAILED_AFTER_BOOKING_SAVED: {backup_exc}")
         notify_teams(law_firm, assessment_date, len(booking_ids), len(saved_files))
         status_class = "success" if sharepoint_ok else "notice"
         return f"""
@@ -1110,11 +1191,14 @@ async def admin_sharepoint_retry(request: Request, document_id: int = Form(...))
 
 
 @application.get("/backend", response_class=HTMLResponse)
-async def backend(request: Request):
+async def backend(request: Request, view: str = "all"):
     if not is_admin(request):
         return RedirectResponse("/admin-login", status_code=303)
 
-    headers, rows = fetch_bookings()
+    try:
+        headers, rows = fetch_bookings(view)
+    except Exception:
+        return HTMLResponse("<h1>Booking storage is unavailable</h1><p>Your records cannot currently be loaded. Check the persistent disk and database configuration; do not create a replacement database.</p>", status_code=503)
     booking_ids = [row[0] for row in rows]
     documents_by_booking = fetch_documents_for_bookings(booking_ids)
 
@@ -1124,6 +1208,9 @@ async def backend(request: Request):
 
     for row in rows:
         booking_id = row[0]
+        archived = bool(row[headers.index("is_archived")])
+        action = "restore-booking" if archived else "delete-booking"
+        action_label = "Restore" if archived else "Archive"
         body_html += "<tr>"
         for value in row:
             body_html += f"<td>{safe_text(value)}</td>"
@@ -1157,13 +1244,15 @@ async def backend(request: Request):
 
         body_html += f"""
         <td class="nowrap">
-            <form action="/delete-booking?admin_key={quote(ADMIN_PASSWORD)}" method="post" onsubmit="return confirm('Delete this booking and its document links?');">
+            <form action="/{action}?admin_key={quote(ADMIN_PASSWORD)}" method="post" onsubmit="return confirm('{action_label} this booking? All records and documents will be retained.');">
                 <input type="hidden" name="booking_id" value="{booking_id}">
-                <button type="submit" class="btn-red">Delete</button>
+                <button type="submit" class="btn-orange">{action_label}</button>
             </form>
         </td></tr>
         """
 
+    if not rows:
+        body_html = f"<tr><td colspan='{len(headers) + 2}'>No bookings in this view. Select All bookings to include archived records. If prior records are missing, check the existing database location and backups.</td></tr>"
     teams_status = "Configured" if TEAMS_WEBHOOK_URL else "Not configured"
     return f"""
     <html><head><title>Protean Backend</title>{CSS}</head><body><div class="container">
@@ -1172,7 +1261,12 @@ async def backend(request: Request):
             <h1>Admin Backend</h1>
         </div>
         <div class="nav">
-            <b>Protean Booking System <span class="badge">Admin Backend</span></b>
+            <b>Protean Booking System <span class="badge">{len(rows)} booking(s) — {safe_text(view)}</span></b>
+            <div>
+                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=all">All bookings</a>
+                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=active">Active</a>
+                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=archived">Archived</a>
+            </div>
             <div>
                 <a class="btn" href="/client">Client Interface</a>
                 <a class="btn" href="/admin/documents?admin_key={quote(ADMIN_PASSWORD)}">All Documents</a>
@@ -1208,6 +1302,17 @@ async def download_document(document_id: int, request: Request):
         media_type=content_type or "application/octet-stream",
         filename=original_filename,
     )
+
+
+@application.post("/restore-booking")
+async def restore_booking(request: Request, booking_id: int = Form(...)):
+    if not is_admin(request):
+        return RedirectResponse("/admin-login", status_code=303)
+    with db_connection() as conn:
+        conn.execute("UPDATE bookings SET is_archived=0, archived_at=NULL WHERE id=?", (booking_id,))
+        conn.execute("UPDATE booking_documents SET is_archived=0 WHERE booking_id=?", (booking_id,))
+    backup_database()
+    return RedirectResponse(f"/backend?admin_key={quote(ADMIN_PASSWORD)}", status_code=303)
 
 
 @application.post("/delete-booking")
@@ -1281,7 +1386,12 @@ async def all_documents(request: Request):
             <p class="subtitle">Permanent document archive</p>
         </div>
         <div class="nav">
-            <b>Protean Booking System <span class="badge">Admin Backend</span></b>
+            <b>Protean Booking System <span class="badge">{len(rows)} booking(s) — {safe_text(view)}</span></b>
+            <div>
+                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=all">All bookings</a>
+                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=active">Active</a>
+                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=archived">Archived</a>
+            </div>
             <div>
                 <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}">Back to Backend</a>
                 <a class="btn" href="/client">Client Interface</a>
@@ -1314,8 +1424,7 @@ async def all_documents(request: Request):
 async def create_manual_backup(request: Request):
     if not is_admin(request):
         return RedirectResponse("/admin-login", status_code=303)
-    backup_database()
-    latest = max(BACKUP_DIR.glob("protean_bookings_*.db"), key=lambda x: x.stat().st_mtime)
+    latest = backup_database()
     return FileResponse(latest, media_type="application/octet-stream", filename=latest.name)
 
 
