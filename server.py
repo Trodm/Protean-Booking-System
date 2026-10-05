@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
 from typing import List
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 from html import escape
 from urllib.parse import quote, urlencode
@@ -271,6 +272,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_submission_reference ON booking_documents(submission_reference)")
         ensure_column(conn, "bookings", "is_archived", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "bookings", "archived_at", "TEXT")
+        ensure_column(conn, "bookings", "date_of_accident", "TEXT")
         ensure_column(conn, "booking_documents", "is_archived", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "booking_documents", "sharepoint_url", "TEXT")
         ensure_column(conn, "booking_documents", "sharepoint_item_id", "TEXT")
@@ -280,6 +282,16 @@ def init_db():
 
 init_db()
 backup_database()
+
+# Mandatory categories follow the existing booking Terms and Conditions.
+MANDATORY_DOCUMENTS = {
+    "loi": "Letter of Instruction",
+    "id": "ID document",
+    "hospital": "Hospital records",
+    "raf1": "RAF 1",
+    "raf4": "RAF 4",
+}
+
 
 
 def option_tags(items):
@@ -657,21 +669,72 @@ async def health():
     }
 
 
+BOOKING_VALIDATION_SCRIPT = r"""
+<script>
+(function () {
+    const form = document.querySelector('form[action="/submit-bulk"]');
+    const button = document.getElementById('submit-booking');
+    const status = document.getElementById('booking-validation');
+    const names = Array.from(form.querySelectorAll('[name="claimant_name"]'));
+    function validate() {
+        let activeCount = 0;
+        let complete = true;
+        names.forEach(function (name) {
+            const row = name.closest('tr');
+            const active = name.value.trim().length > 0;
+            const accident = row.querySelector('[name="date_of_accident"]');
+            accident.required = active;
+            if (active) {
+                activeCount++;
+                if (!accident.value || !accident.validity.valid) complete = false;
+            }
+            row.querySelectorAll('.mandatory-file').forEach(function (input) {
+                input.required = active;
+                if (active && (!input.files.length || input.files[0].size === 0)) complete = false;
+                input.setCustomValidity(active && input.files.length && input.files[0].size === 0
+                    ? 'Please attach a non-empty document.' : '');
+            });
+        });
+        button.disabled = !activeCount || !complete;
+        status.textContent = button.disabled
+            ? 'Enter Date of Accident and attach all five mandatory document types for each named claimant.'
+            : 'Mandatory attachments selected. Complete the remaining fields and accept the terms to submit.';
+        return !button.disabled;
+    }
+    form.addEventListener('input', validate);
+    form.addEventListener('change', validate);
+    form.addEventListener('submit', function (event) {
+        if (!validate()) { event.preventDefault(); form.reportValidity(); }
+    });
+    validate();
+})();
+</script>
+"""
+
+
 @application.get("/client", response_class=HTMLResponse)
 async def client_interface(error: str = ""):
     rows = ""
     for i in range(1, 11):
+        mandatory_uploads = "".join(
+            f'<label>{safe_text(label)} *<input type="file" '
+            f'name="mandatory_{i - 1}_{key}" class="mandatory-file" '
+            f'aria-label="Claimant {i}: {safe_text(label)}" '
+            f'accept="{",".join(sorted(ALLOWED_EXTENSIONS))}"></label>'
+            for key, label in MANDATORY_DOCUMENTS.items()
+        )
         rows += f"""
         <tr>
             <td>{i}</td>
             <td><input name="claimant_name" placeholder="Claimant Name"></td>
             <td><input type="date" name="date_of_birth"></td>
+            <td><input type="date" name="date_of_accident" aria-label="Date of Accident for claimant {i}"></td>
             <td><select name="gender"><option></option>{option_tags(GENDERS)}</select></td>
             <td><select name="preferred_language"><option></option>{option_tags(LANGUAGES)}</select></td>
             <td><input name="contact_number" placeholder="Phone / WhatsApp"></td>
             <td><select name="occupation_status"><option></option>{option_tags(OCCUPATIONS)}</select></td>
             <td><input name="claim_type" placeholder="LOS, LOE, Medical negligence, etc."></td>
-            <td><input name="mandatory_documents_submitted" placeholder="LOI, ID, Hospital records, RAF 1, RAF 4, etc."></td>
+            <td>{mandatory_uploads}</td>
             <td><input name="injuries_sustained" placeholder="Head, spinal, fracture, etc."></td>
             <td><input type="date" name="prescribing_date"></td>
             <td><input name="protean_experts" placeholder="Expert(s) scheduled"></td>
@@ -701,7 +764,7 @@ async def client_interface(error: str = ""):
 
     <div class="table-wrap"><table>
     <tr>
-    <th>#</th><th>Claimant Name</th><th>DOB</th><th>Gender</th><th>Preferred Language</th><th>Contact Number</th><th>Occupation Status</th><th>Type of Claim</th><th>Documents Submitted</th><th>Injuries Sustained</th><th>Prescribing Date</th><th>Protean Expert(s) Scheduled</th>
+    <th>#</th><th>Claimant Name</th><th>DOB</th><th>Date of Accident</th><th>Gender</th><th>Preferred Language</th><th>Contact Number</th><th>Occupation Status</th><th>Type of Claim</th><th>Mandatory Documents (per claimant)</th><th>Injuries Sustained</th><th>Prescribing Date</th><th>Protean Expert(s) Scheduled</th>
     </tr>{rows}</table></div>
 
     <div class="bottom-grid">
@@ -715,8 +778,8 @@ async def client_interface(error: str = ""):
     </div>
 
     <div class="terms">
-        <h3>Upload Supporting Documents</h3>
-        <p>Upload the Letter of Instruction, ID, hospital records, RAF 1, RAF 4 and other supporting documents. You may select several files at once or select additional files again.</p>
+        <h3>Additional Supporting Documents (optional)</h3>
+        <p>Attach all five mandatory document types in each completed claimant row above. A booking cannot be submitted until every mandatory document is attached. Use this section for additional documents shared across the submission. You may select several files at once or select additional files again.</p>
         <div class="upload-box">
             <input id="document_upload" type="file" name="documents" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.png,.jpg,.jpeg,.tif,.tiff,.txt">
             <p class="small">Maximum {MAX_FILE_SIZE_MB} MB per file. Uploaded documents are linked to each claimant in this submission and become available in the admin backend.</p>
@@ -732,7 +795,7 @@ async def client_interface(error: str = ""):
         <p>By booking an assessment appointment, I acknowledge and agree to the following:</p>
         <ul>
             <li>All mandatory documents, including the Letter of Instruction, ID document, hospital records, and RAF 1 and RAF 4 forms, must be submitted using the same email address through which the booking link was sent.</li>
-            <li>If the required documents cannot be submitted electronically before the assessment, the original documents or copies thereof must be brought on the day of the assessment.</li>
+            <li>All relevant documentation must be received no later than 48 hours prior to the scheduled date of assessment.</li>
             <li>It remains the responsibility of the attorney to ensure that all supporting documentation required to finalize the report is submitted timeously and accurately.</li>
         </ul>
     </div>
@@ -740,15 +803,18 @@ async def client_interface(error: str = ""):
         <input type="checkbox" name="terms_accepted" value="Accepted" required>
         <span>I have read and accepted the Terms and Conditions.</span>
     </label>
-    <div class="actions"><button type="submit">Submit Booking and Upload Documents</button></div>
+    <p id="booking-validation" role="status">Enter a claimant and attach all mandatory documents before submitting.</p>
+    <div class="actions"><button id="submit-booking" type="submit">Submit Booking and Upload Documents</button></div>
     </form>
     {FILE_UPLOAD_SCRIPT}
+    {BOOKING_VALIDATION_SCRIPT}
     </div></body></html>
     """
 
 
 @application.post("/submit-bulk", response_class=HTMLResponse)
 async def submit_bulk(
+    request: Request,
     law_firm: str = Form(""), law_firm_contact_person: str = Form(""), law_firm_phone: str = Form(""),
     law_firm_email: str = Form(""), assessment_place: str = Form(""), assessment_date: str = Form(""),
     additional_information: str = Form(""), permission_to_contact: str = Form(""), expert_affidavits: str = Form(""),
@@ -757,6 +823,7 @@ async def submit_bulk(
     preferred_language: List[str] = Form(default=[]), contact_number: List[str] = Form(default=[]), occupation_status: List[str] = Form(default=[]),
     claim_type: List[str] = Form(default=[]), mandatory_documents_submitted: List[str] = Form(default=[]), injuries_sustained: List[str] = Form(default=[]),
     prescribing_date: List[str] = Form(default=[]), protean_experts: List[str] = Form(default=[]),
+    date_of_accident: List[str] = Form(default=[]),
     documents: List[UploadFile] = File(default=[]),
 ):
     saved_files = []
@@ -768,7 +835,40 @@ async def submit_bulk(
         if terms_accepted != "Accepted":
             return RedirectResponse("/client?error=" + quote("You must accept the Terms and Conditions."), status_code=303)
 
-        # Save files first. If any file is invalid, all files from this submission are removed.
+        if len(names) > 10:
+            raise ValueError("A maximum of 10 claimant rows is allowed per booking.")
+        form = await request.form()
+        mandatory_uploads = []
+        today = datetime.now(ZoneInfo("Africa/Johannesburg")).date()
+        for i, name in enumerate(names):
+            if not name:
+                continue
+            accident_text = date_of_accident[i] if i < len(date_of_accident) else ""
+            try:
+                accident = datetime.strptime(accident_text, "%Y-%m-%d").date()
+            except ValueError:
+                raise ValueError(f"Claimant {i + 1}: enter a valid Date of Accident.")
+            if accident > today:
+                raise ValueError(f"Claimant {i + 1}: Date of Accident cannot be in the future.")
+            missing = []
+            for key, label in MANDATORY_DOCUMENTS.items():
+                uploads = form.getlist(f"mandatory_{i}_{key}")
+                if len(uploads) != 1 or not getattr(uploads[0], "filename", None):
+                    missing.append(label)
+                else:
+                    mandatory_uploads.append((i, label, uploads[0]))
+            if missing:
+                raise ValueError(f"Claimant {i + 1}: attach all mandatory documents. Missing: " + ", ".join(missing))
+
+        # Validate and save every required attachment before inserting any bookings.
+        # Any invalid or empty file removes all files saved for this submission.
+        for claimant_index, label, upload in mandatory_uploads:
+            file_info = await save_uploaded_file(upload, submission_reference)
+            file_info["claimant_index"] = claimant_index
+            file_info["original_filename"] = label + " - " + file_info["original_filename"]
+            saved_files.append(file_info)
+
+        # Save optional shared files with the same validation and rollback behavior.
         for upload in documents:
             if upload and upload.filename:
                 saved_files.append(await save_uploaded_file(upload, submission_reference))
@@ -782,6 +882,7 @@ async def submit_bulk(
             file_info["sharepoint_item_id"] = ""
 
         booking_ids = []
+        booking_indexes = {}
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with db_connection() as conn:
             for i, cn in enumerate(names[:10]):
@@ -796,12 +897,12 @@ async def submit_bulk(
                     contact_number[i] if i < len(contact_number) else "",
                     occupation_status[i] if i < len(occupation_status) else "",
                     claim_type[i] if i < len(claim_type) else "",
-                    mandatory_documents_submitted[i] if i < len(mandatory_documents_submitted) else "",
+                    ", ".join(MANDATORY_DOCUMENTS.values()),
                     injuries_sustained[i] if i < len(injuries_sustained) else "",
                     prescribing_date[i] if i < len(prescribing_date) else "",
                     protean_experts[i] if i < len(protean_experts) else "",
                     additional_information.strip(), permission_to_contact, expert_affidavits,
-                    terms_accepted, "", "", "", "", "", "", "", "", "New", ""
+                    terms_accepted, "", "", "", "", "", "", "", "", "New", "", date_of_accident[i]
                 )
                 cur = conn.execute("""
                 INSERT INTO bookings (
@@ -812,14 +913,17 @@ async def submit_bulk(
                     additional_information, permission_to_contact, expert_affidavits, terms_accepted,
                     external_experts, assigned_caller, call_attempted, date_of_call, contact_outcome,
                     documents_requested, documents_expected_on_day, claimants_readiness_notes,
-                    booking_status, mandatory_los_documents
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    booking_status, mandatory_los_documents, date_of_accident
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, row)
                 booking_ids.append(cur.lastrowid)
+                booking_indexes[cur.lastrowid] = i
 
-            # Link every uploaded document to every claimant in the same batch.
+            # Required documents belong only to their claimant; optional files are shared.
             for booking_id in booking_ids:
                 for file_info in saved_files:
+                    if file_info.get("claimant_index", booking_indexes[booking_id]) != booking_indexes[booking_id]:
+                        continue
                     conn.execute("""
                     INSERT INTO booking_documents (
                         submission_reference, booking_id, original_filename, stored_filename,
