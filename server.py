@@ -26,12 +26,7 @@ application = FastAPI(title="Protean Booking System")
 # automatically when available. You can also override DATA_DIR, DB_FILE,
 # UPLOAD_DIR and EXPORT_DIR through environment variables.
 BASE_DIR = Path(__file__).resolve().parent
-# Render deployment: mount a Persistent Disk at /var/data and set DATA_DIR=/var/data.
-# Keep one service instance for SQLite. Back up the disk separately as well.
-# Only for a genuinely new installation: set ALLOW_NEW_DATABASE=true once.
-ON_RENDER = os.getenv("RENDER", "").lower() == "true" or bool(os.getenv("RENDER_SERVICE_ID"))
-PERSISTENT_MOUNT = Path(os.getenv("PERSISTENT_DISK_PATH", "/var/data")).resolve()
-DEFAULT_DATA_DIR = PERSISTENT_MOUNT if ON_RENDER or PERSISTENT_MOUNT.is_mount() else BASE_DIR
+DEFAULT_DATA_DIR = Path("/var/data") if Path("/var/data").exists() else BASE_DIR
 DATA_DIR = Path(os.getenv("DATA_DIR", str(DEFAULT_DATA_DIR))).resolve()
 DB_FILE = Path(os.getenv("DB_FILE", str(DATA_DIR / "protean_bookings.db"))).resolve()
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads"))).resolve()
@@ -58,38 +53,10 @@ ALLOWED_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".txt"
 }
 
-def disk_is_mounted(path):
-    """Recognize Linux bind mounts as well as separate-device mounts."""
-    path = Path(path).resolve()
-    if path.is_mount():
-        return True
-    try:
-        # os.path.ismount may miss bind mounts on the same filesystem.
-        for line in Path("/proc/self/mountinfo").read_text().splitlines():
-            fields = line.split()
-            if len(fields) < 5:
-                continue
-            mount_path = fields[4]
-            for encoded, decoded in ((r"\040", " "), (r"\011", "\t"),
-                                     (r"\012", "\n"), (r"\134", "\\")):
-                mount_path = mount_path.replace(encoded, decoded)
-            if Path(mount_path).resolve() == path:
-                return True
-    except OSError:
-        pass
-    return False
-
-
-def check_storage():
-    if ON_RENDER:
-        if not disk_is_mounted(PERSISTENT_MOUNT):
-            raise RuntimeError(f"No disk mount detected at {PERSISTENT_MOUNT}. Attach the existing persistent disk or set PERSISTENT_DISK_PATH to its actual mount path. Temporary booking storage is disabled.")
-        for location in (DATA_DIR, DB_FILE, UPLOAD_DIR, BACKUP_DIR):
-            if not location.is_relative_to(PERSISTENT_MOUNT):
-                raise RuntimeError("Database, uploads and backups must all be on the persistent disk.")
-
-
-STORAGE_ERROR = None
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 LOGO_BASE64 = "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"
 
@@ -211,15 +178,11 @@ FILE_UPLOAD_SCRIPT = r"""
 """
 
 @contextmanager
-def db_connection(create=False):
-    check_storage()
-    # Normal reads/writes must never create a new empty database.
-    mode = "rwc" if create else "rw"
-    conn = sqlite3.connect(DB_FILE.as_uri() + "?mode=" + mode, uri=True, timeout=30)
+def db_connection():
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = FULL")
         yield conn
         conn.commit()
     except Exception:
@@ -230,73 +193,21 @@ def db_connection(create=False):
 
 
 def backup_database():
-    """Publish only complete snapshots; retain daily recovery points for 90 days."""
+    """Create an atomic SQLite backup and retain the latest 30 copies."""
+    if not DB_FILE.exists():
+        return
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = BACKUP_DIR / f"protean_bookings_{timestamp}.db"
-    temporary = backup_path.with_suffix(".partial")
+    source = sqlite3.connect(DB_FILE, timeout=30)
+    target = sqlite3.connect(backup_path)
     try:
-        with db_connection() as source:
-            target = sqlite3.connect(temporary)
-            try:
-                source.backup(target)
-                if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                    raise RuntimeError("Backup verification failed")
-            finally:
-                target.close()
-        temporary.replace(backup_path)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
-    # Keep the latest 30 snapshots plus one snapshot per day for 90 days.
-    backups = sorted(BACKUP_DIR.glob("protean_bookings_*.db"), reverse=True)
-    keep = set(backups[:30])
-    days = set()
-    for snapshot in backups:
-        day = snapshot.name.split("_")[2]
-        if day not in days and len(days) < 90:
-            keep.add(snapshot)
-            days.add(day)
-    for snapshot in backups:
-        if snapshot not in keep:
-            snapshot.unlink(missing_ok=True)
-    return backup_path
-
-
-def prepare_database():
-    """Recover a missing database only; never overwrite an existing database."""
-    marker = DB_FILE.with_suffix(DB_FILE.suffix + ".initialized")
-    if DB_FILE.exists():
-        with sqlite3.connect(DB_FILE.as_uri() + "?mode=ro", uri=True) as conn:
-            if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise RuntimeError("Database integrity check failed. Preserve this disk and restore a verified backup before restarting.")
-            has_bookings = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bookings'").fetchone()
-            if not has_bookings:
-                raise RuntimeError("Existing database has no bookings table. Check DB_FILE; refusing to replace it with an empty backend.")
-        return
-    backups = sorted(BACKUP_DIR.glob("protean_bookings_*.db"), reverse=True)
-    if Path(str(DB_FILE) + "-wal").exists():
-        raise RuntimeError("Database missing but transaction journal exists. Preserve files for database recovery.")
-    for snapshot in backups:
-        temporary = DB_FILE.with_suffix(".recovering")
-        try:
-            with sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True) as source:
-                if source.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                    continue
-                source.execute("SELECT COUNT(*) FROM bookings").fetchone()
-                with sqlite3.connect(temporary) as target:
-                    source.backup(target)
-            temporary.replace(DB_FILE)
-            print(f"DATABASE_RECOVERED_FROM_BACKUP: {snapshot.name}")
-            return
-        except sqlite3.DatabaseError:
-            continue
-        finally:
-            temporary.unlink(missing_ok=True)
-    legacy = BASE_DIR / "protean_bookings.db"
-    if marker.exists() or backups or (legacy != DB_FILE and legacy.exists()):
-        raise RuntimeError("Existing booking storage could not be opened. Restore or migrate the original SQLite database and uploads; refusing to start with an empty database.")
-    if ON_RENDER and os.getenv("ALLOW_NEW_DATABASE", "").lower() != "true":
-        raise RuntimeError("No existing database found on the persistent disk. Restore the original database, or set ALLOW_NEW_DATABASE=true only for a genuinely new installation.")
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+    backups = sorted(BACKUP_DIR.glob("protean_bookings_*.db"), key=lambda x: x.stat().st_mtime, reverse=True)
+    for old_backup in backups[30:]:
+        old_backup.unlink(missing_ok=True)
 
 
 def ensure_column(conn, table_name: str, column_name: str, definition: str):
@@ -306,7 +217,7 @@ def ensure_column(conn, table_name: str, column_name: str, definition: str):
 
 
 def init_db():
-    with db_connection(create=True) as conn:
+    with db_connection() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -369,18 +280,8 @@ def init_db():
         ensure_column(conn, "booking_documents", "sharepoint_error", "TEXT")
 
 
-try:
-    check_storage()
-    for directory in (UPLOAD_DIR, EXPORT_DIR, BACKUP_DIR, DB_FILE.parent):
-        directory.mkdir(parents=True, exist_ok=True)
-    prepare_database()
-    init_db()
-    DB_FILE.with_suffix(DB_FILE.suffix + ".initialized").touch()
-except (RuntimeError, OSError, sqlite3.Error) as exc:
-    STORAGE_ERROR = str(exc)
-    print(f"BOOKING_STORAGE_SETUP_REQUIRED: {STORAGE_ERROR}")
-    # Keep the HTTP process available for setup; never create a temporary DB.
-
+init_db()
+backup_database()
 
 # Mandatory categories follow the existing booking Terms and Conditions.
 MANDATORY_DOCUMENTS = {
@@ -405,13 +306,12 @@ def safe_text(value):
     return escape("" if value is None else str(value))
 
 
-def fetch_bookings(view="all"):
+def fetch_bookings():
     with db_connection() as conn:
-        where = {"active": " WHERE COALESCE(is_archived, 0)=0", "archived": " WHERE COALESCE(is_archived, 0)=1", "all": ""}.get(view, "")
-        cur = conn.execute("SELECT * FROM bookings" + where + " ORDER BY id DESC")
+        cur = conn.execute("SELECT * FROM bookings WHERE COALESCE(is_archived, 0)=0 ORDER BY id DESC")
         all_headers = [d[0] for d in cur.description]
         all_rows = cur.fetchall()
-    hidden = set()
+    hidden = {"is_archived", "archived_at"}
     keep_indexes = [i for i, name in enumerate(all_headers) if name not in hidden]
     headers = [all_headers[i] for i in keep_indexes]
     rows = [tuple(row[i] for i in keep_indexes) for row in all_rows]
@@ -750,57 +650,6 @@ OCCUPATIONS = ["Employed", "Self-employed", "Student/scholar", "Unemployed", "Mi
 YES_NO = ["Yes", "No"]
 
 
-@application.middleware("http")
-async def storage_availability_guard(request: Request, call_next):
-    global STORAGE_ERROR
-    allowed = {"/health/live", "/health", "/admin-login", "/admin/storage"}
-    if request.url.path not in allowed:
-        if STORAGE_ERROR is None:
-            try:
-                with db_connection() as conn:
-                    conn.execute("SELECT id FROM bookings LIMIT 1").fetchone()
-            except (RuntimeError, OSError, sqlite3.Error) as exc:
-                STORAGE_ERROR = str(exc)
-                print(f"BOOKING_STORAGE_UNAVAILABLE: {STORAGE_ERROR}")
-        if STORAGE_ERROR is not None:
-            # Page can load; all booking writes and downloads remain unavailable.
-            status = 200 if request.method == "GET" and request.url.path in {"/", "/client"} else 503
-            return HTMLResponse(f"""<html><head><title>Protean Booking System</title>{CSS}</head>
-            <body><div class='login-box'><h1>Bookings temporarily unavailable</h1>
-            <p>The booking records cannot currently be loaded. New submissions are paused while the administrator restores access.</p>
-            <p>Please contact the office for assistance with your booking.</p>
-            <a class='btn' href='/admin/storage'>Administrator storage setup</a>
-            </div></body></html>""", status_code=status, headers={"Cache-Control": "no-store"})
-    return await call_next(request)
-
-
-@application.get("/health/live")
-async def liveness():
-    # Render can keep the setup screen online; /health remains readiness (503 if blocked).
-    return {"status": "running", "bookings_ready": STORAGE_ERROR is None}
-
-
-@application.get("/admin/storage", response_class=HTMLResponse)
-async def storage_setup(request: Request):
-    if not is_admin(request):
-        return RedirectResponse("/admin-login?storage=1", status_code=303)
-    return f"""<html><head><title>Booking Storage Setup</title>{CSS}</head><body>
-    <div class='container'><h1>Booking Storage Setup</h1>
-    <div class='notice'>{safe_text(STORAGE_ERROR or 'Storage is ready.')}</div>
-    <ol>
-    <li>In Render, open this service's Disks page. Use the existing persistent disk and its actual mount path. A paid service is required for a persistent disk.</li>
-    <li>For a disk mounted at /var/data, set DATA_DIR=/var/data and PERSISTENT_DISK_PATH=/var/data. For a different mount path, use that path for both settings.</li>
-    <li>Keep DB_FILE, UPLOAD_DIR and BACKUP_DIR under the same disk. Preserve the existing database and uploads. A new empty disk will not contain earlier bookings.</li>
-    <li>Restore the existing protean_bookings.db and uploads, or place a verified backup in the backups folder while the service is stopped. Never overwrite a live database.</li>
-    <li>Only for a genuinely new installation with no previous records: set ALLOW_NEW_DATABASE=true for the first startup, then remove it. This does not recover records.</li>
-    <li>Use /health/live as the Render health check path to keep this setup screen available. /health returns 503 until booking storage is ready. Redeploy after correcting storage.</li>
-    </ol>
-    <p>Configured data directory: {safe_text(DATA_DIR)}<br>Database: {safe_text(DB_FILE)}<br>Disk mount: {safe_text(PERSISTENT_MOUNT)}</p>
-    <a href='https://render.com/docs/disks'>Render persistent disk instructions</a>
-    <p><a class='btn' href='/backend?admin_key={quote(ADMIN_PASSWORD)}'>Open Backend</a></p>
-    </div></body></html>"""
-
-
 @application.get("/")
 async def root():
     return RedirectResponse("/client", status_code=303)
@@ -808,20 +657,13 @@ async def root():
 
 @application.get("/health")
 async def health():
-    if STORAGE_ERROR is not None:
-        raise HTTPException(status_code=503, detail="Booking storage requires administrator setup.")
-    try:
-        with db_connection() as conn:
-            conn.execute("SELECT COUNT(*) FROM bookings").fetchone()
-    except Exception:
-        raise HTTPException(status_code=503, detail="Booking storage unavailable; administrator recovery required.")
     return {
         "status": "ok",
         "data_directory": str(DATA_DIR),
         "database": str(DB_FILE),
         "upload_directory": str(UPLOAD_DIR),
         "upload_directory_exists": UPLOAD_DIR.exists(),
-        "persistent_disk_active": disk_is_mounted(PERSISTENT_MOUNT) and DATA_DIR.is_relative_to(PERSISTENT_MOUNT),
+        "persistent_disk_active": str(DATA_DIR).startswith("/var/data"),
         "backup_directory": str(BACKUP_DIR),
         "database_backups": len(list(BACKUP_DIR.glob("protean_bookings_*.db"))),
     }
@@ -1139,10 +981,7 @@ async def submit_bulk(
                 if SHAREPOINT_REQUIRED:
                     print("SHAREPOINT_REQUIRED is enabled, but the booking remains preserved locally.")
 
-        try:
-            backup_database()
-        except Exception as backup_exc:
-            print(f"BACKUP_FAILED_AFTER_BOOKING_SAVED: {backup_exc}")
+        backup_database()
         notify_teams(law_firm, assessment_date, len(booking_ids), len(saved_files))
         status_class = "success" if sharepoint_ok else "notice"
         return f"""
@@ -1178,8 +1017,7 @@ async def admin_login(error: str = ""):
 @application.post("/admin-login")
 async def admin_login_submit(password: str = Form("")):
     if password == ADMIN_PASSWORD:
-        destination = "/admin/storage" if STORAGE_ERROR is not None else "/backend"
-        return RedirectResponse(f"{destination}?admin_key={quote(ADMIN_PASSWORD)}", status_code=303)
+        return RedirectResponse(f"/backend?admin_key={quote(ADMIN_PASSWORD)}", status_code=303)
     return RedirectResponse("/admin-login?error=1", status_code=303)
 
 
@@ -1272,14 +1110,11 @@ async def admin_sharepoint_retry(request: Request, document_id: int = Form(...))
 
 
 @application.get("/backend", response_class=HTMLResponse)
-async def backend(request: Request, view: str = "all"):
+async def backend(request: Request):
     if not is_admin(request):
         return RedirectResponse("/admin-login", status_code=303)
 
-    try:
-        headers, rows = fetch_bookings(view)
-    except Exception:
-        return HTMLResponse("<h1>Booking storage is unavailable</h1><p>Your records cannot currently be loaded. Check the persistent disk and database configuration; do not create a replacement database.</p>", status_code=503)
+    headers, rows = fetch_bookings()
     booking_ids = [row[0] for row in rows]
     documents_by_booking = fetch_documents_for_bookings(booking_ids)
 
@@ -1289,9 +1124,6 @@ async def backend(request: Request, view: str = "all"):
 
     for row in rows:
         booking_id = row[0]
-        archived = bool(row[headers.index("is_archived")])
-        action = "restore-booking" if archived else "delete-booking"
-        action_label = "Restore" if archived else "Archive"
         body_html += "<tr>"
         for value in row:
             body_html += f"<td>{safe_text(value)}</td>"
@@ -1325,15 +1157,13 @@ async def backend(request: Request, view: str = "all"):
 
         body_html += f"""
         <td class="nowrap">
-            <form action="/{action}?admin_key={quote(ADMIN_PASSWORD)}" method="post" onsubmit="return confirm('{action_label} this booking? All records and documents will be retained.');">
+            <form action="/delete-booking?admin_key={quote(ADMIN_PASSWORD)}" method="post" onsubmit="return confirm('Delete this booking and its document links?');">
                 <input type="hidden" name="booking_id" value="{booking_id}">
-                <button type="submit" class="btn-orange">{action_label}</button>
+                <button type="submit" class="btn-red">Delete</button>
             </form>
         </td></tr>
         """
 
-    if not rows:
-        body_html = f"<tr><td colspan='{len(headers) + 2}'>No bookings in this view. Select All bookings to include archived records. If prior records are missing, check the existing database location and backups.</td></tr>"
     teams_status = "Configured" if TEAMS_WEBHOOK_URL else "Not configured"
     return f"""
     <html><head><title>Protean Backend</title>{CSS}</head><body><div class="container">
@@ -1342,12 +1172,7 @@ async def backend(request: Request, view: str = "all"):
             <h1>Admin Backend</h1>
         </div>
         <div class="nav">
-            <b>Protean Booking System <span class="badge">{len(rows)} booking(s) — {safe_text(view)}</span></b>
-            <div>
-                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=all">All bookings</a>
-                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=active">Active</a>
-                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=archived">Archived</a>
-            </div>
+            <b>Protean Booking System <span class="badge">Admin Backend</span></b>
             <div>
                 <a class="btn" href="/client">Client Interface</a>
                 <a class="btn" href="/admin/documents?admin_key={quote(ADMIN_PASSWORD)}">All Documents</a>
@@ -1383,17 +1208,6 @@ async def download_document(document_id: int, request: Request):
         media_type=content_type or "application/octet-stream",
         filename=original_filename,
     )
-
-
-@application.post("/restore-booking")
-async def restore_booking(request: Request, booking_id: int = Form(...)):
-    if not is_admin(request):
-        return RedirectResponse("/admin-login", status_code=303)
-    with db_connection() as conn:
-        conn.execute("UPDATE bookings SET is_archived=0, archived_at=NULL WHERE id=?", (booking_id,))
-        conn.execute("UPDATE booking_documents SET is_archived=0 WHERE booking_id=?", (booking_id,))
-    backup_database()
-    return RedirectResponse(f"/backend?admin_key={quote(ADMIN_PASSWORD)}", status_code=303)
 
 
 @application.post("/delete-booking")
@@ -1467,12 +1281,7 @@ async def all_documents(request: Request):
             <p class="subtitle">Permanent document archive</p>
         </div>
         <div class="nav">
-            <b>Protean Booking System <span class="badge">{len(rows)} booking(s) — {safe_text(view)}</span></b>
-            <div>
-                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=all">All bookings</a>
-                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=active">Active</a>
-                <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}&view=archived">Archived</a>
-            </div>
+            <b>Protean Booking System <span class="badge">Admin Backend</span></b>
             <div>
                 <a class="btn" href="/backend?admin_key={quote(ADMIN_PASSWORD)}">Back to Backend</a>
                 <a class="btn" href="/client">Client Interface</a>
@@ -1505,7 +1314,8 @@ async def all_documents(request: Request):
 async def create_manual_backup(request: Request):
     if not is_admin(request):
         return RedirectResponse("/admin-login", status_code=303)
-    latest = backup_database()
+    backup_database()
+    latest = max(BACKUP_DIR.glob("protean_bookings_*.db"), key=lambda x: x.stat().st_mtime)
     return FileResponse(latest, media_type="application/octet-stream", filename=latest.name)
 
 
