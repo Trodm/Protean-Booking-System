@@ -87,7 +87,7 @@ button,.btn{background:#1f2937;color:white;padding:10px 16px;border:none;border-
 .check-row input{width:auto;margin-top:3px}.file-list{margin:0;padding-left:18px}.file-list li{margin:3px 0}
 .small{font-size:12px;color:#555}.nowrap{white-space:nowrap}
 .upload-box{border:2px dashed #9ca3af;border-radius:10px;padding:16px;background:#fff}
-.upload-box input[type=file]{padding:10px;background:#f9fafb}
+.upload-box input[type=file]{padding:10px;background:#f9fafb}.document-checklist{border:1px solid #d1d5db;border-radius:6px;margin-top:10px;padding:8px}.document-checklist legend{font-weight:700;font-size:12px}.checklist-item{display:flex;align-items:flex-start;gap:6px;margin:7px 0;font-size:12px}.checklist-item input{width:auto;flex:0 0 auto;margin-top:2px}.claimant-upload{min-width:220px}
 .selected-files{margin-top:12px;border:1px solid #d1d5db;border-radius:8px;background:white;padding:10px}
 .selected-files-title{font-weight:700;margin-bottom:8px}
 .selected-files ul{list-style:none;margin:0;padding:0}
@@ -283,13 +283,14 @@ def init_db():
 init_db()
 backup_database()
 
-# Mandatory categories follow the existing booking Terms and Conditions.
-MANDATORY_DOCUMENTS = {
-    "loi": "Letter of Instruction",
-    "id": "ID document",
-    "hospital": "Hospital records",
-    "raf1": "RAF 1",
-    "raf4": "RAF 4",
+# Descriptive checklist for RAF and non-RAF claimant documents.
+DOCUMENT_CHECKLIST = {
+    "instruction": "Letter of instruction / referral",
+    "identity": "ID / personal identity documents",
+    "medical": "Medical / hospital records",
+    "employment": "Employment documents (payslips, bank statements, employer records)",
+    "education": "Education documents (school reports, certificates, academic records)",
+    "claim_specific": "Other claim-specific supporting documents",
 }
 
 
@@ -673,32 +674,31 @@ BOOKING_VALIDATION_SCRIPT = r"""
 <script>
 (function () {
     const form = document.querySelector('form[action="/submit-bulk"]');
+    if (!form) return;
     const button = document.getElementById('submit-booking');
     const status = document.getElementById('booking-validation');
     const names = Array.from(form.querySelectorAll('[name="claimant_name"]'));
     function validate() {
-        let activeCount = 0;
-        let complete = true;
+        let activeCount = 0, complete = true;
         names.forEach(function (name) {
             const row = name.closest('tr');
             const active = name.value.trim().length > 0;
             const accident = row.querySelector('[name="date_of_accident"]');
+            const fileInput = row.querySelector('.claimant-file');
+            const checks = Array.from(row.querySelectorAll('.document-checklist input[type="checkbox"]'));
             accident.required = active;
+            fileInput.required = active;
             if (active) {
                 activeCount++;
                 if (!accident.value || !accident.validity.valid) complete = false;
+                if (!fileInput.files.length || Array.from(fileInput.files).some(f => f.size === 0)) complete = false;
+                if (!checks.some(c => c.checked)) complete = false;
             }
-            row.querySelectorAll('.mandatory-file').forEach(function (input) {
-                input.required = active;
-                if (active && (!input.files.length || input.files[0].size === 0)) complete = false;
-                input.setCustomValidity(active && input.files.length && input.files[0].size === 0
-                    ? 'Please attach a non-empty document.' : '');
-            });
         });
         button.disabled = !activeCount || !complete;
         status.textContent = button.disabled
-            ? 'Enter Date of Accident and attach all five mandatory document types for each named claimant.'
-            : 'Mandatory attachments selected. Complete the remaining fields and accept the terms to submit.';
+            ? 'For each named claimant, enter the Date of Accident, upload supporting documents, and tick at least one checklist item.'
+            : 'Claimant uploads and document checklists are complete. Review the terms and consent choice before submitting.';
         return !button.disabled;
     }
     form.addEventListener('input', validate);
@@ -716,12 +716,9 @@ BOOKING_VALIDATION_SCRIPT = r"""
 async def client_interface(error: str = ""):
     rows = ""
     for i in range(1, 11):
-        mandatory_uploads = "".join(
-            f'<label>{safe_text(label)} *<input type="file" '
-            f'name="mandatory_{i - 1}_{key}" class="mandatory-file" '
-            f'aria-label="Claimant {i}: {safe_text(label)}" '
-            f'accept="{",".join(sorted(ALLOWED_EXTENSIONS))}"></label>'
-            for key, label in MANDATORY_DOCUMENTS.items()
+        checklist = "".join(
+            f'<label class="checklist-item"><input type="checkbox" name="documents_checklist_{i - 1}" value="{safe_text(key)}"> {safe_text(label)}</label>'
+            for key, label in DOCUMENT_CHECKLIST.items()
         )
         rows += f"""
         <tr>
@@ -734,7 +731,13 @@ async def client_interface(error: str = ""):
             <td><input name="contact_number" placeholder="Phone / WhatsApp"></td>
             <td><select name="occupation_status"><option></option>{option_tags(OCCUPATIONS)}</select></td>
             <td><input name="claim_type" placeholder="LOS, LOE, Medical negligence, etc."></td>
-            <td>{mandatory_uploads}</td>
+            <td><div class="upload-box claimant-upload">
+                <label><b>Upload supporting documents for this claimant</b>
+                <input type="file" name="claimant_documents_{i - 1}" class="claimant-file" multiple
+                       accept="{','.join(sorted(ALLOWED_EXTENSIONS))}"></label>
+                <p class="small">Select multiple files in this single upload control. Maximum {MAX_FILE_SIZE_MB} MB per file.</p>
+                <fieldset class="document-checklist"><legend>What does this upload contain? Tick all that apply.</legend>{checklist}</fieldset>
+            </div></td>
             <td><input name="injuries_sustained" placeholder="Head, spinal, fracture, etc."></td>
             <td><input type="date" name="prescribing_date"></td>
             <td><input name="protean_experts" placeholder="Expert(s) scheduled"></td>
@@ -764,49 +767,41 @@ async def client_interface(error: str = ""):
 
     <div class="table-wrap"><table>
     <tr>
-    <th>#</th><th>Claimant Name</th><th>DOB</th><th>Date of Accident</th><th>Gender</th><th>Preferred Language</th><th>Contact Number</th><th>Occupation Status</th><th>Type of Claim</th><th>Mandatory Documents (per claimant)</th><th>Injuries Sustained</th><th>Prescribing Date</th><th>Protean Expert(s) Scheduled</th>
+    <th>#</th><th>Claimant Name</th><th>DOB</th><th>Date of Accident</th><th>Gender</th><th>Preferred Language</th><th>Contact Number</th><th>Occupation Status</th><th>Type of Claim</th><th>Claimant Documents &amp; Checklist</th><th>Injuries Sustained</th><th>Prescribing Date</th><th>Protean Expert(s) Scheduled</th>
     </tr>{rows}</table></div>
 
     <div class="bottom-grid">
         <div><label><b>Additional Information</b></label><textarea name="additional_information" placeholder="Please provide any other relevant details for any claimant."></textarea></div>
         <div>
-            <label><b>Do you grant us permission to contact the claimant if additional information is required?</b></label>
-            <select name="permission_to_contact"><option></option>{option_tags(YES_NO)}</select><br><br>
+            <label><b>Consent to contact claimants before / after assessment</b></label>
+            <p class="small">We may contact claimants to obtain missing personal documents before the assessment and, where needed, to clarify information while finalising the report. Please indicate whether Protean may contact claimants for these purposes.</p>
+            <select name="permission_to_contact" required><option value="">Please select</option>{option_tags(YES_NO)}</select><br><br>
             <label><b>Would you like expert affidavits submitted with the reports?</b></label>
             <select name="expert_affidavits"><option></option>{option_tags(YES_NO)}</select>
         </div>
     </div>
 
-    <div class="terms">
-        <h3>Additional Supporting Documents (optional)</h3>
-        <p>Attach all five mandatory document types in each completed claimant row above. A booking cannot be submitted until every mandatory document is attached. Use this section for additional documents shared across the submission. You may select several files at once or select additional files again.</p>
-        <div class="upload-box">
-            <input id="document_upload" type="file" name="documents" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.png,.jpg,.jpeg,.tif,.tiff,.txt">
-            <p class="small">Maximum {MAX_FILE_SIZE_MB} MB per file. Uploaded documents are linked to each claimant in this submission and become available in the admin backend.</p>
-            <div class="selected-files" aria-live="polite">
-                <div id="selected_document_count" class="selected-files-title">0 documents selected</div>
-                <ul id="selected_document_list"><li class="empty-files">No documents selected yet.</li></ul>
-            </div>
-        </div>
+    <div class="notice">
+        Upload documents separately for each claimant using that claimant's single upload control above. The checklist records the document types supplied and applies to RAF and non-RAF matters.
     </div>
 
     <div class="terms">
         <h3>Terms and Conditions</h3>
         <p>By booking an assessment appointment, I acknowledge and agree to the following:</p>
         <ul>
-            <li>All mandatory documents, including the Letter of Instruction, ID document, hospital records, and RAF 1 and RAF 4 forms, must be submitted using the same email address through which the booking link was sent.</li>
-            <li>All relevant documentation must be received no later than 48 hours prior to the scheduled date of assessment.</li>
-            <li>It remains the responsibility of the attorney to ensure that all supporting documentation required to finalize the report is submitted timeously and accurately.</li>
+            <li>Upload supporting documents for each claimant using the single upload control provided for that claimant, and tick the checklist items that describe the documents included. This applies to RAF and non-RAF matters.</li>
+            <li>All documents required to complete the report must be uploaded at least 48 hours before the scheduled assessment. This includes, where relevant, personal identity documents, medical records, employment documents (including payslips, bank statements and employer records), and education documents (including school reports, certificates and academic records), as well as any other claim-specific supporting documents.</li>
+            <li>The attorney remains responsible for ensuring that all relevant and complete documentation is submitted accurately and on time.</li>
+            <li>Consent to contact is limited to obtaining missing personal documents before the assessment and clarifying information during report finalisation where necessary.</li>
         </ul>
     </div>
     <label class="check-row">
         <input type="checkbox" name="terms_accepted" value="Accepted" required>
         <span>I have read and accepted the Terms and Conditions.</span>
     </label>
-    <p id="booking-validation" role="status">Enter a claimant and attach all mandatory documents before submitting.</p>
+    <p id="booking-validation" role="status">Enter a claimant, upload supporting documents, and complete the document checklist.</p>
     <div class="actions"><button id="submit-booking" type="submit">Submit Booking and Upload Documents</button></div>
     </form>
-    {FILE_UPLOAD_SCRIPT}
     {BOOKING_VALIDATION_SCRIPT}
     </div></body></html>
     """
@@ -834,11 +829,14 @@ async def submit_bulk(
             return RedirectResponse("/client?error=" + quote("Please enter at least one claimant name."), status_code=303)
         if terms_accepted != "Accepted":
             return RedirectResponse("/client?error=" + quote("You must accept the Terms and Conditions."), status_code=303)
+        if permission_to_contact not in {"Yes", "No"}:
+            return RedirectResponse("/client?error=" + quote("Please select Yes or No for consent to contact claimants."), status_code=303)
 
         if len(names) > 10:
             raise ValueError("A maximum of 10 claimant rows is allowed per booking.")
         form = await request.form()
-        mandatory_uploads = []
+        claimant_uploads = []
+        checklist_by_index = {}
         today = datetime.now(ZoneInfo("Africa/Johannesburg")).date()
         for i, name in enumerate(names):
             if not name:
@@ -850,28 +848,21 @@ async def submit_bulk(
                 raise ValueError(f"Claimant {i + 1}: enter a valid Date of Accident.")
             if accident > today:
                 raise ValueError(f"Claimant {i + 1}: Date of Accident cannot be in the future.")
-            missing = []
-            for key, label in MANDATORY_DOCUMENTS.items():
-                uploads = form.getlist(f"mandatory_{i}_{key}")
-                if len(uploads) != 1 or not getattr(uploads[0], "filename", None):
-                    missing.append(label)
-                else:
-                    mandatory_uploads.append((i, label, uploads[0]))
-            if missing:
-                raise ValueError(f"Claimant {i + 1}: attach all mandatory documents. Missing: " + ", ".join(missing))
+            selected_keys = form.getlist(f"documents_checklist_{i}")
+            selected_labels = [DOCUMENT_CHECKLIST[k] for k in selected_keys if k in DOCUMENT_CHECKLIST]
+            if not selected_labels:
+                raise ValueError(f"Claimant {i + 1}: tick at least one item in the document checklist.")
+            checklist_by_index[i] = ", ".join(selected_labels)
+            uploads = [u for u in form.getlist(f"claimant_documents_{i}") if getattr(u, "filename", None)]
+            if not uploads:
+                raise ValueError(f"Claimant {i + 1}: upload at least one supporting document.")
+            claimant_uploads.extend((i, upload) for upload in uploads)
 
-        # Validate and save every required attachment before inserting any bookings.
-        # Any invalid or empty file removes all files saved for this submission.
-        for claimant_index, label, upload in mandatory_uploads:
+        # Save each claimant's files before inserting bookings; clean up on validation failure.
+        for claimant_index, upload in claimant_uploads:
             file_info = await save_uploaded_file(upload, submission_reference)
             file_info["claimant_index"] = claimant_index
-            file_info["original_filename"] = label + " - " + file_info["original_filename"]
             saved_files.append(file_info)
-
-        # Save optional shared files with the same validation and rollback behavior.
-        for upload in documents:
-            if upload and upload.filename:
-                saved_files.append(await save_uploaded_file(upload, submission_reference))
 
         # Save the booking and local document records first. SharePoint sync happens
         # afterwards so a Microsoft outage never destroys the client's submission.
@@ -897,7 +888,7 @@ async def submit_bulk(
                     contact_number[i] if i < len(contact_number) else "",
                     occupation_status[i] if i < len(occupation_status) else "",
                     claim_type[i] if i < len(claim_type) else "",
-                    ", ".join(MANDATORY_DOCUMENTS.values()),
+                    checklist_by_index.get(i, ""),
                     injuries_sustained[i] if i < len(injuries_sustained) else "",
                     prescribing_date[i] if i < len(prescribing_date) else "",
                     protean_experts[i] if i < len(protean_experts) else "",
